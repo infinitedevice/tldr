@@ -737,13 +737,16 @@ mod tests {
     #[test]
     fn prefs_round_trip() {
         let s = test_store();
-        assert_eq!(s.get_pref("theme"), None);
-        s.set_pref("theme", "dark").unwrap();
-        assert_eq!(s.get_pref("theme"), Some("dark".to_string()));
-        s.set_pref("theme", "light").unwrap();
-        assert_eq!(s.get_pref("theme"), Some("light".to_string()));
+        assert_eq!(s.get_pref("sidebar_collapsed"), None);
+        s.set_pref("sidebar_collapsed", "true").unwrap();
+        assert_eq!(s.get_pref("sidebar_collapsed"), Some("true".to_string()));
+        s.set_pref("sidebar_collapsed", "false").unwrap();
+        assert_eq!(s.get_pref("sidebar_collapsed"), Some("false".to_string()));
 
         let all = s.get_all_prefs().unwrap();
-        assert_eq!(all.get("theme").map(|s| s.as_str()), Some("light"));
+        assert_eq!(
+            all.get("sidebar_collapsed").map(|s| s.as_str()),
+            Some("false"),
+        );
     }
 }
