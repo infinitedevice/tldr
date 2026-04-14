@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/infinitedevice/tldr/actions/workflows/ci.yml/badge.svg)](https://github.com/infinitedevice/tldr/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/infinitedevice/tldr)](https://github.com/infinitedevice/tldr/releases/latest)
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
 
 A Mattermost channel summarisation tool. A background daemon polls your unread channels, passes recent messages to a local or remote LLM (via an OpenAI-compatible API), and serves summaries both as a web UI and via a terminal CLI.
 
@@ -162,4 +162,4 @@ See [AGENTS.md](AGENTS.md) for a detailed architecture guide aimed at AI coding 
 
 ## License
 
-[GNU Affero General Public License v3.0](LICENSE)
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

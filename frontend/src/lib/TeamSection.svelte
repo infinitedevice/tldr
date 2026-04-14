@@ -1,7 +1,7 @@
 <script lang="ts">
   // SPDX-FileCopyrightText: 2026 Martin Donnelly
   // SPDX-FileCopyrightText: 2026 Collabora Ltd.
-  // SPDX-License-Identifier: AGPL-3.0-or-later
+  // SPDX-License-Identifier: MIT OR Apache-2.0
 
   /**
    * @component TeamSection
@@ -10,7 +10,7 @@
    * so the parent can refresh state without a full re-fetch.
    */
 
-  import ActionItemsList from './ActionItemsList.svelte';
+  import ActionItemsList from "./ActionItemsList.svelte";
 
   interface ActionItem {
     id: string;
@@ -52,12 +52,18 @@
     favouriteIds?: Set<string>;
     onActionItemUpdate: () => void;
     onMarkRead: (channelId: string) => void;
-    onToggleFavourite?: (channelId: string, channelName: string, teamName: string) => void;
+    onToggleFavourite?: (
+      channelId: string,
+      channelName: string,
+      teamName: string,
+    ) => void;
   } = $props();
 
   async function markRead(channelId: string) {
     try {
-      await fetch(`/api/v1/channels/${encodeURIComponent(channelId)}/read`, { method: 'POST' });
+      await fetch(`/api/v1/channels/${encodeURIComponent(channelId)}/read`, {
+        method: "POST",
+      });
       onMarkRead(channelId);
     } catch {
       // Non-fatal: watermark will catch up on next run
@@ -67,7 +73,9 @@
 
 <div class="space-y-8">
   {#each summaries as s}
-    <article      data-tour="channel-card"      class="bg-gray-800 rounded-lg border border-gray-700 p-5"
+    <article
+      data-tour="channel-card"
+      class="bg-gray-800 rounded-lg border border-gray-700 p-5"
       aria-labelledby="channel-{s.channel_name}"
     >
       <div class="flex items-start gap-3 mb-3 flex-wrap">
@@ -85,16 +93,28 @@
                 #{s.channel_name}
               </a>
             {:else}
-              <span class="text-green-400 font-bold text-base" id="channel-{s.channel_name}">
+              <span
+                class="text-green-400 font-bold text-base"
+                id="channel-{s.channel_name}"
+              >
                 #{s.channel_name}
               </span>
             {/if}
             <button
-              onclick={() => onToggleFavourite?.(s.channel_id, s.channel_name, s.team_name)}
-              class="text-xl leading-none transition-colors {favouriteIds.has(s.channel_id) ? 'text-yellow-400 hover:text-yellow-200' : 'text-gray-600 hover:text-yellow-400'}"
-              title={favouriteIds.has(s.channel_id) ? 'Remove from favourites' : 'Add to favourites'}
-              aria-label={favouriteIds.has(s.channel_id) ? `Remove #${s.channel_name} from favourites` : `Add #${s.channel_name} to favourites`}
-            >★</button>
+              onclick={() =>
+                onToggleFavourite?.(s.channel_id, s.channel_name, s.team_name)}
+              class="text-xl leading-none transition-colors {favouriteIds.has(
+                s.channel_id,
+              )
+                ? 'text-yellow-400 hover:text-yellow-200'
+                : 'text-gray-600 hover:text-yellow-400'}"
+              title={favouriteIds.has(s.channel_id)
+                ? "Remove from favourites"
+                : "Add to favourites"}
+              aria-label={favouriteIds.has(s.channel_id)
+                ? `Remove #${s.channel_name} from favourites`
+                : `Add #${s.channel_name} to favourites`}>★</button
+            >
           </div>
 
           <!-- DM / group topic subtitle -->
@@ -105,7 +125,7 @@
           <!-- DM / group participants -->
           {#if s.participants && s.participants.length > 0}
             <p class="text-xs text-gray-500 mt-0.5">
-              with {s.participants.join(', ')}
+              with {s.participants.join(", ")}
             </p>
           {/if}
         </div>
@@ -117,7 +137,9 @@
             {/if}
             {#if s.mention_count > 0}
               {#if s.unread_count > 0}&nbsp;·&nbsp;{/if}
-              <span class="text-red-400 font-semibold">{s.mention_count} mentions</span>
+              <span class="text-red-400 font-semibold"
+                >{s.mention_count} mentions</span
+              >
             {/if}
           </span>
 
@@ -137,8 +159,10 @@
       <div data-tour="summary-html" class="space-y-3">
         {#if s.topics && s.topics.length > 0}
           {#each s.topics as topic, i}
-            <div class={i > 0 ? 'border-t border-gray-700/50 pt-3' : ''}>
-              <h4 class="text-sm font-semibold text-gray-300 mb-1">{topic.title}</h4>
+            <div class={i > 0 ? "border-t border-gray-700/50 pt-3" : ""}>
+              <h4 class="text-sm font-semibold text-gray-300 mb-1">
+                {topic.title}
+              </h4>
               <div class="prose prose-invert prose-sm max-w-none text-gray-200">
                 {@html topic.summary_html}
               </div>
@@ -164,4 +188,3 @@
     </article>
   {/each}
 </div>
-

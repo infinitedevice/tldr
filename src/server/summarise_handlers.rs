@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Martin Donnelly
 // SPDX-FileCopyrightText: 2026 Collabora Ltd.
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! HTTP handlers for summarisation: on-demand, streaming NDJSON, clear-state,
 //! and the Mattermost slash command.

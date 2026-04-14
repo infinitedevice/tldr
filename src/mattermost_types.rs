@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Martin Donnelly
 // SPDX-FileCopyrightText: 2026 Collabora Ltd.
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Serde-deserializable types mirroring the Mattermost REST API v4 response shapes.
 //!
