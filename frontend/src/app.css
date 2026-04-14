@@ -1,0 +1,9 @@
+@import "tailwindcss";
+@import "@skeletonlabs/skeleton/themes/cerberus";
+@import "@skeletonlabs/skeleton";
+
+/* @mention highlight for known Mattermost usernames in channel summaries */
+.mention {
+    color: #60a5fa;
+    font-weight: 500;
+}

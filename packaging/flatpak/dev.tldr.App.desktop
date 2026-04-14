@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=TLDR
+GenericName=Chat Summariser
+Comment=Summarise your unread Mattermost channels with AI
+Exec=tldr-daemon
+Icon=dev.tldr.App
+Terminal=false
+Type=Application
+Categories=Network;Chat;Utility;
+Keywords=mattermost;chat;summary;ai;llm;
+StartupNotify=true

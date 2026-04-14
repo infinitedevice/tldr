@@ -1,0 +1,16 @@
+/target
+frontend/node_modules
+frontend/dist
+
+#  agent created files
+.bashrc
+.bash_profile
+.env
+.fastembed_cache/
+.idea
+.mcp.json
+.profile
+.ripgreprc
+.vscode
+.zprofile
+.zshrc

@@ -1,0 +1,41 @@
+app-id: dev.tldr.App
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.node22
+command: tldr-daemon
+finish-args:
+  - --share=network
+  - --socket=x11
+  - --socket=wayland
+  - --filesystem=home
+  - --talk-name=org.freedesktop.Notifications
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node22/bin
+
+modules:
+  - name: tldr-daemon
+    buildsystem: simple
+    build-commands:
+      # Build Rust backend
+      - cargo --offline fetch --manifest-path Cargo.toml
+      - cargo --offline build --release --bin tldr-daemon --bin tldr-cli
+      - install -Dm755 target/release/tldr-daemon /app/bin/tldr-daemon
+      - install -Dm755 target/release/tldr-cli    /app/bin/tldr
+      # Build frontend
+      - cd frontend && npm ci --offline
+      - cd frontend && npm run build
+      - install -Dm644 -t /app/share/tldr/frontend/dist frontend/dist/index.html
+      - "find frontend/dist/assets -type f | xargs -I{} install -Dm644 {} /app/share/tldr/frontend/dist/assets/"
+      # Desktop integration
+      - install -Dm644 packaging/flatpak/dev.tldr.App.desktop /app/share/applications/dev.tldr.App.desktop
+      - install -Dm644 packaging/flatpak/dev.tldr.App.metainfo.xml /app/share/metainfo/dev.tldr.App.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..
+      - type: file
+        path: cargo-sources.json
+        dest-filename: cargo-sources.json

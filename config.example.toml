@@ -1,0 +1,23 @@
+[mattermost]
+server_url = "https://chat.example.com"
+token = "your-personal-access-token"
+
+[llm]
+# OpenAI-compatible API endpoint and model name.
+# e.g. base_url = "https://api.openai.com/v1"
+#      model    = "gpt-4o"
+base_url = ""
+model = ""
+bearer_token = ""
+
+[paths]
+# Free-text description of your role, used to personalise cross-channel insights.
+# user_role = "Senior engineer working on CI/CD and desktop integration"
+state_file = "~/.config/tldr/state.json"
+
+[server]
+listen_addr = "127.0.0.1:8765"
+# How often (in seconds) the daemon re-summarises unread channels in the background.
+# Set to 0 to disable automatic summarisation.
+poll_interval_secs = 600
+# slash_token = "your-mattermost-slash-command-token"
