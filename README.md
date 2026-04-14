@@ -12,7 +12,7 @@ A Mattermost channel summarisation tool. A background daemon polls your unread c
 
 - **Web UI** — per-team cards with rendered markdown, channel hyperlinks, action item tracking, theme switcher (Skeleton UI)
 - **CLI** — ANSI-rendered summaries with OSC 8 hyperlinks, mentions-prioritised ordering
-- **Historical context** — fetches one working day of history as LLM background; focuses summary on genuinely unread messages
+- **Historical context** — each summary includes one working day of message history as LLM background; first-run seeding backfills ~4 weeks of insights
 - **Action items** — extracted by the LLM, stored in SQLite, tracked across runs; mark as ignored via the web UI
 - **Read-state watermarks** — SQLite DB so repeated runs are incremental
 - **Config wizard** — first-run web wizard if no config file is present (Flatpak-compatible)
@@ -132,21 +132,36 @@ tldr-daemon  (axum HTTP server, port 8765)
   │
   ├── GET  /api/v1/summaries           — cached summaries (instant)
   ├── GET  /api/v1/summaries/subscribe — SSE stream of live updates
+  ├── GET  /api/v1/summarise           — on-demand summarise (JSON)
   ├── GET  /api/v1/summarise/stream    — on-demand NDJSON summarise
   ├── GET  /api/v1/health              — daemon health + poll_interval_secs
+  ├── GET  /api/v1/me                  — authenticated user info
+  ├── GET  /api/v1/me/avatar           — user avatar proxy
   ├── GET  /api/v1/config/status       — check if configured
   ├── GET  /api/v1/config              — read config (tokens redacted)
   ├── PUT  /api/v1/config              — save config (wizard)
+  ├── GET  /api/v1/channels            — all subscribed channels
+  ├── GET  /api/v1/channels/unread     — unread counts per channel
+  ├── GET  /api/v1/channels/categories — channel sidebar categories
+  ├── POST /api/v1/channels/:id/read   — mark channel as read
   ├── GET  /api/v1/action-items        — pending action items
   ├── PATCH /api/v1/action-items/:id   — mark ignored/resolved
+  ├── GET  /api/v1/user-prefs          — user preferences
+  ├── PUT  /api/v1/user-prefs          — update user preferences
+  ├── GET  /api/v1/insights            — historical channel insights
+  ├── GET  /api/v1/favourites          — favourite channels list
+  ├── POST /api/v1/favourites/:id      — add favourite
+  ├── DELETE /api/v1/favourites/:id    — remove favourite
+  ├── GET  /api/v1/seeding/status      — first-run seeding progress
   ├── DELETE /api/v1/state             — clear watermarks
+  ├── GET  /llms.txt                   — LLM-readable site description
   ├── POST /slash/summarise            — Mattermost slash command
   └── /*                               — serve frontend/dist (ServeDir)
 
 tldr-cli                               — HTTP client to the daemon
 ```
 
-State is persisted in `~/.config/tldr/state.db` (SQLite). Tables: `channel_watermark`, `action_item`, `cached_summary`.
+State is persisted in `~/.config/tldr/state.db` (SQLite). Tables: `channel_watermark`, `action_item`, `cached_summary`, `user_prefs`, `channel_insights`, `favourite_channel`.
 
 See [AGENTS.md](AGENTS.md) for a detailed architecture guide aimed at AI coding agents.
 
