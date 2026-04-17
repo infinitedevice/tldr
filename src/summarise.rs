@@ -26,7 +26,7 @@ use crate::llm::{FormattedMessage, LlmClient, TopicPoint};
 use crate::mattermost::MattermostClient;
 use crate::mattermost_types::{Channel, Post, Team, User};
 use crate::output::{ActionItemSummary, ChannelSummary, TopicSection};
-use crate::rag::{ChannelRecord, VectorStore, record_id};
+use crate::rag::{VectorStore, record_id};
 use crate::store::{ChannelInsight, Store};
 
 /// Format structured [`TopicPoint`]s as a Markdown string.
@@ -328,7 +328,7 @@ async fn summarise_channel(
 
     // Acquire the semaphore to serialise LLM calls (avoids memory spikes)
     let _permit = llm_sem.acquire().await.expect("LLM semaphore closed");
-    let (llm_result, raw_response) = llm
+    let (llm_result, _) = llm
         .summarise(
             channel.label(),
             &context_formatted.0,
@@ -373,34 +373,30 @@ async fn summarise_channel(
             .collect()
     };
 
-    // RAG: store this analysis result for future context enrichment
+    // RAG: store raw message chunks for future context enrichment
     if let Some(ref vs) = rag {
         let now_ms = jiff::Timestamp::now().as_millisecond();
-        let topics_json = serde_json::to_string(
-            &llm_result
-                .topics
-                .iter()
-                .map(|t| t.title.clone())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap_or_else(|_| "[]".to_string());
         let summary_for_rag = format_topics_markdown(&llm_result.topics, &llm_result.summary);
 
-        let record = ChannelRecord {
-            id: record_id(&channel.id, now_ms),
-            channel_id: channel.id.clone(),
-            channel_name: channel_display_name.clone(),
-            timestamp_ms: now_ms,
-            summary: summary_for_rag,
-            topics: topics_json,
-            raw_insight: raw_response,
-            risk_score: 0.0,
-            importance_score: 0.0,
-        };
+        // Build formatted message strings so the embedding captures the actual
+        // conversation content rather than (a summary of) the LLM output.
+        let message_texts: Vec<String> = unread_formatted
+            .iter()
+            .map(|m| format!("[{}] {}: {}", m.timestamp, m.username, m.content))
+            .collect();
 
-        if let Err(e) = vs.upsert(record).await {
+        if let Err(e) = vs
+            .store_thread_chunks(
+                &channel.id,
+                &channel_display_name,
+                now_ms,
+                &message_texts,
+                &summary_for_rag,
+            )
+            .await
+        {
             warn!(
-                "failed to store RAG record for channel {}: {e:#}",
+                "failed to store RAG thread chunks for channel {}: {e:#}",
                 channel.label()
             );
         }
