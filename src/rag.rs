@@ -365,7 +365,8 @@ impl VectorStore {
     }
 
     /// Split `messages` into chunks of [`CHUNK_SIZE`] and store each chunk as a
-    /// separate embedding keyed by its raw message content.
+    /// separate embedding record, using the raw chunk text as the embedding
+    /// input.
     ///
     /// Embedding the raw message text (rather than the LLM summary) lets the
     /// vector search find historical discussions that are semantically similar to
