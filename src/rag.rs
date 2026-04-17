@@ -28,6 +28,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use futures::TryStreamExt;
 use lancedb::Connection;
+use lancedb::Table;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -60,6 +61,7 @@ pub struct ChannelRecord {
 #[derive(Clone)]
 pub struct VectorStore {
     conn: Connection,
+    table: Table,
     embedder: Arc<Mutex<TextEmbedding>>,
     schema: SchemaRef,
 }
@@ -105,6 +107,12 @@ impl VectorStore {
                 .context("failed to create channel_summaries table")?;
         }
 
+        let table = conn
+            .open_table(TABLE_CHANNEL_SUMMARIES)
+            .execute()
+            .await
+            .context("failed to open channel_summaries table")?;
+
         // Initialise fastembed in a blocking thread — model download may take a while.
         info!(
             "initialising fastembed embedding model (NomicEmbedTextV15) — on first run this downloads ~274 MB and may take a few minutes"
@@ -130,6 +138,7 @@ impl VectorStore {
 
         Ok(Self {
             conn,
+            table,
             embedder: Arc::new(Mutex::new(embedder)),
             schema,
         })
@@ -157,12 +166,7 @@ impl VectorStore {
         .context("embedding task panicked")??;
 
         let channel_id = channel_id.to_string();
-        let table = self
-            .conn
-            .open_table(TABLE_CHANNEL_SUMMARIES)
-            .execute()
-            .await
-            .context("failed to open channel_summaries table")?;
+        let table = &self.table;
 
         let row_count = table
             .count_rows(None)
@@ -222,12 +226,7 @@ impl VectorStore {
         let schema = Arc::clone(&self.schema);
         let batch = record_to_batch(&record, &embedding, &schema)?;
 
-        let table = self
-            .conn
-            .open_table(TABLE_CHANNEL_SUMMARIES)
-            .execute()
-            .await
-            .context("failed to open channel_summaries table for upsert")?;
+        let table = &self.table;
 
         let iter = RecordBatchIterator::new(vec![Ok(batch)], Arc::clone(&schema));
 
