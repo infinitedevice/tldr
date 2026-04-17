@@ -102,6 +102,7 @@ struct EmbedderPool {
 impl EmbedderPool {
     fn new(instances: Vec<TextEmbedding>) -> Self {
         let n = instances.len();
+        debug_assert!(n > 0, "EmbedderPool must be initialised with at least one instance");
         Self {
             slots: Arc::new(Mutex::new(instances)),
             available: Arc::new(tokio::sync::Semaphore::new(n)),
@@ -211,29 +212,34 @@ impl VectorStore {
         // be created on the next daemon restart once enough rows have accumulated.
         // `replace(false)` ensures we do not needlessly rebuild an existing index.
         if !table_is_new {
-            let row_count = table.count_rows(None).await.unwrap_or(0);
-            if row_count >= MIN_INDEX_ROWS {
-                debug!(rows = row_count, "attempting to create IVF-PQ ANN index");
-                match table
-                    .create_index(
-                        &["embedding"],
-                        Index::IvfPq(IvfPqIndexBuilder::default()),
-                    )
-                    .replace(false)
-                    .execute()
-                    .await
-                {
-                    Ok(()) => info!("IVF-PQ ANN index created on embedding column"),
-                    Err(e) => {
-                        debug!("ANN index creation skipped (already exists or insufficient data): {e}");
+            match table.count_rows(None).await {
+                Ok(row_count) if row_count >= MIN_INDEX_ROWS => {
+                    debug!(rows = row_count, "attempting to create IVF-PQ ANN index");
+                    match table
+                        .create_index(
+                            &["embedding"],
+                            Index::IvfPq(IvfPqIndexBuilder::default()),
+                        )
+                        .replace(false)
+                        .execute()
+                        .await
+                    {
+                        Ok(()) => info!("IVF-PQ ANN index created on embedding column"),
+                        // `replace(false)` causes an error when the index already exists;
+                        // that is the expected steady-state after the first successful run.
+                        Err(e) => debug!("ANN index already exists, skipping creation: {e}"),
                     }
                 }
-            } else {
-                debug!(
-                    rows = row_count,
-                    needed = MIN_INDEX_ROWS,
-                    "skipping ANN index: not enough rows yet"
-                );
+                Ok(row_count) => {
+                    debug!(
+                        rows = row_count,
+                        needed = MIN_INDEX_ROWS,
+                        "skipping ANN index: not enough rows yet"
+                    );
+                }
+                Err(e) => {
+                    debug!("could not count rows for ANN index decision: {e}");
+                }
             }
         }
 
@@ -456,16 +462,20 @@ impl VectorStore {
             let embeddings = self.embedder.embed_batch(batch_texts).await?;
 
             let mut guard = self.cache.lock().expect("embed cache mutex poisoned");
-            // Evict the oldest entries if inserting the new batch would exceed
-            // the cap.  HashMap iteration order is unspecified but eviction is
-            // best-effort so the exact choice of victims does not matter.
+            // Evict entries if the new batch would push the cache over capacity.
+            // `retain` makes a single O(n) pass, avoiding repeated rehashing.
             let new_total = guard.len() + embeddings.len();
             if new_total > EMBED_CACHE_MAX {
                 let excess = new_total - EMBED_CACHE_MAX;
-                let to_remove: Vec<String> = guard.keys().take(excess).cloned().collect();
-                for k in to_remove {
-                    guard.remove(&k);
-                }
+                let mut removed = 0_usize;
+                guard.retain(|_, _| {
+                    if removed < excess {
+                        removed += 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
             for ((i, text), embedding) in uncached.into_iter().zip(embeddings.into_iter()) {
                 guard.insert(text, embedding.clone());
@@ -489,9 +499,10 @@ impl VectorStore {
 /// SQL filter string.
 ///
 /// Mattermost channel IDs are 26-character lowercase alphanumeric strings.
-/// This function also permits hyphens and underscores (used in synthetic chunk
-/// IDs) but rejects anything that could be exploited for SQL injection even
-/// after the existing quoting.
+/// Hyphens and underscores are explicitly allowed here because synthetic chunk
+/// IDs (produced by [`VectorStore::store_thread_chunks`]) append `-chunk-N` to
+/// the original Mattermost ID.  Anything else is rejected to prevent SQL injection
+/// even after the single-quote delimiters used in the filter expression.
 fn validate_channel_id(channel_id: &str) -> Result<()> {
     if channel_id.is_empty() {
         anyhow::bail!("channel_id must not be empty");
