@@ -226,15 +226,17 @@ impl VectorStore {
                         .await
                     {
                         Ok(()) => info!("IVF-PQ ANN index created on embedding column"),
-                        // `replace(false)` causes an error when the index already exists;
-                        // that is the expected steady-state after the first successful run.
+                        // `replace(false)` causes lancedb to return a `Lance` error when
+                        // the index already exists; that is the expected steady-state.
+                        // `lance::Error` is opaque so we use message inspection only
+                        // within this specific variant; all other variants are real errors.
+                        Err(lancedb::Error::Lance { ref source })
+                            if source.to_string().contains("already exists") =>
+                        {
+                            debug!("IVF-PQ ANN index already exists, skipping creation");
+                        }
                         Err(e) => {
-                            let msg = e.to_string().to_lowercase();
-                            if msg.contains("already exist") || msg.contains("already exists") {
-                                debug!("IVF-PQ ANN index already exists, skipping creation");
-                            } else {
-                                warn!("failed to create IVF-PQ ANN index (non-trivial error): {e}");
-                            }
+                            warn!("failed to create IVF-PQ ANN index: {e}");
                         }
                     }
                 }
@@ -459,6 +461,8 @@ impl VectorStore {
         let mut uncached: Vec<(usize, String)> = Vec::new();
 
         {
+            // `mut` is required because `LruCache::get` takes `&mut self`
+            // to update access ordering (LRU promotion on cache hit).
             let mut guard = self.cache.lock().expect("embed cache mutex poisoned");
             for (i, text) in texts.iter().enumerate() {
                 if let Some(v) = guard.get(text.as_str()) {
