@@ -40,6 +40,7 @@ arrow-array = "51"
 arrow-schema = "51"
 fastembed = "4"
 futures = "0.3"
+lru = "0.12"
 # ort rc.9 (used by fastembed 4.x) bundles ONNX Runtime 1.18 via ort-sys rc.9.
 # Pin exactly to prevent Cargo from pulling an incompatible ort-sys version.
 ort-sys = "=2.0.0-rc.9"

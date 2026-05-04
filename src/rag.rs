@@ -18,6 +18,16 @@
 //! # Threading
 //! fastembed's `TextEmbedding::embed()` is synchronous ONNX inference; it is always
 //! wrapped in [`tokio::task::spawn_blocking`] to avoid blocking the async runtime.
+//!
+//! # Embedding pool
+//! [`EmbedderPool`] holds one or more `TextEmbedding` instances, gated by a tokio
+//! [`Semaphore`], so that multiple concurrent callers can embed in parallel when more
+//! than one instance is provisioned.
+//!
+//! # Caching
+//! Already-computed embeddings are kept in a bounded in-memory cache
+//! (capped at [`EMBED_CACHE_MAX`] entries) so repeated summarise runs for
+//! identical text incur no ONNX inference overhead.
 
 use anyhow::{Context, Result};
 use arrow_array::{
@@ -28,16 +38,29 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use futures::TryStreamExt;
 use lancedb::Connection;
+use lancedb::Table;
+use lancedb::index::{Index, vector::IvfPqIndexBuilder};
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Embedding dimension for NomicEmbedTextV15.
 const EMBED_DIM: i32 = 768;
 
 /// Name of the channel summaries table in LanceDB.
 const TABLE_CHANNEL_SUMMARIES: &str = "channel_summaries";
+
+/// Minimum row count required before an IVF-PQ ANN index is created on open.
+const MIN_INDEX_ROWS: usize = 256;
+
+/// Maximum number of embedding vectors held in the in-memory cache.
+const EMBED_CACHE_MAX: usize = 1024;
+
+/// Number of messages packed into each stored thread chunk.
+const CHUNK_SIZE: usize = 20;
 
 /// A stored analysis record for a channel analysis run.
 #[derive(Debug, Clone)]
@@ -46,9 +69,16 @@ pub struct ChannelRecord {
     pub channel_id: String,
     pub channel_name: String,
     pub timestamp_ms: i64,
+    /// Text stored in the database and used as the embedding input.
+    ///
+    /// Records produced by [`VectorStore::store_thread_chunks`] store a chunk
+    /// of raw message content here; records produced by [`VectorStore::upsert`]
+    /// store the LLM summary text.
     pub summary: String,
     /// JSON-serialized `Vec<String>` of topics.
     pub topics: String,
+    /// For chunk records this holds the LLM summary so [`VectorStore::format_context`]
+    /// can surface a human-readable insight rather than raw messages.
     pub raw_insight: String,
     /// Placeholder until `insights.rs` computes real scores.
     pub risk_score: f32,
@@ -56,12 +86,77 @@ pub struct ChannelRecord {
     pub importance_score: f32,
 }
 
+// ─── Embedder pool ─────────────────────────────────────────────────────────────
+
+/// A pool of `TextEmbedding` instances for concurrent embedding.
+///
+/// Each call to [`EmbedderPool::embed_batch`] acquires one instance via a tokio
+/// [`Semaphore`], runs ONNX inference inside [`tokio::task::spawn_blocking`],
+/// then returns the instance to the pool before resolving.  Increasing the
+/// initial pool size (by passing more instances to [`EmbedderPool::new`]) allows
+/// multiple concurrent embed calls to run in parallel.
+struct EmbedderPool {
+    slots: Arc<Mutex<Vec<TextEmbedding>>>,
+    available: Arc<tokio::sync::Semaphore>,
+}
+
+impl EmbedderPool {
+    fn new(instances: Vec<TextEmbedding>) -> Self {
+        let n = instances.len();
+        debug_assert!(n > 0, "EmbedderPool must be initialised with at least one instance");
+        Self {
+            slots: Arc::new(Mutex::new(instances)),
+            available: Arc::new(tokio::sync::Semaphore::new(n)),
+        }
+    }
+
+    /// Embed `texts` in a single ONNX inference call.
+    ///
+    /// Checks out one `TextEmbedding` instance from the pool (waiting if none
+    /// are currently available), runs inference in a blocking thread, returns
+    /// the instance to the pool, and resolves with the embedding vectors.
+    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        let _permit = self
+            .available
+            .acquire()
+            .await
+            .context("embedder pool semaphore closed")?;
+
+        let embedder = self
+            .slots
+            .lock()
+            .expect("embedder pool mutex poisoned")
+            .pop()
+            .context("embedder pool unexpectedly empty")?;
+
+        let (embedder, vecs) =
+            tokio::task::spawn_blocking(move || -> Result<(TextEmbedding, Vec<Vec<f32>>)> {
+                let vecs = embedder
+                    .embed(texts, None)
+                    .context("ONNX embedding failed")?;
+                Ok((embedder, vecs))
+            })
+            .await
+            .context("embed task panicked")??;
+
+        self.slots
+            .lock()
+            .expect("embedder pool mutex poisoned")
+            .push(embedder);
+
+        Ok(vecs)
+    }
+}
+
 /// Embedded, persistent vector store for channel analysis history.
 #[derive(Clone)]
 pub struct VectorStore {
     conn: Connection,
-    embedder: Arc<Mutex<TextEmbedding>>,
+    table: Table,
+    embedder: Arc<EmbedderPool>,
     schema: SchemaRef,
+    /// Bounded in-memory LRU cache: text → embedding vector.
+    cache: Arc<Mutex<LruCache<String, Vec<f32>>>>,
 }
 
 impl VectorStore {
@@ -97,12 +192,65 @@ impl VectorStore {
             .await
             .context("failed to list LanceDB tables")?;
 
-        if !existing.contains(&TABLE_CHANNEL_SUMMARIES.to_string()) {
+        let table_is_new = !existing.contains(&TABLE_CHANNEL_SUMMARIES.to_string());
+
+        if table_is_new {
             info!("creating new LanceDB table: {TABLE_CHANNEL_SUMMARIES}");
             conn.create_empty_table(TABLE_CHANNEL_SUMMARIES, Arc::clone(&schema))
                 .execute()
                 .await
                 .context("failed to create channel_summaries table")?;
+        }
+
+        let table = conn
+            .open_table(TABLE_CHANNEL_SUMMARIES)
+            .execute()
+            .await
+            .context("failed to open channel_summaries table")?;
+
+        // Build an IVF-PQ ANN index when the table already has enough data.
+        // On a fresh empty table this is intentionally skipped; the index will
+        // be created on the next daemon restart once enough rows have accumulated.
+        // `replace(false)` ensures we do not needlessly rebuild an existing index.
+        if !table_is_new {
+            match table.count_rows(None).await {
+                Ok(row_count) if row_count >= MIN_INDEX_ROWS => {
+                    debug!(rows = row_count, "attempting to create IVF-PQ ANN index");
+                    match table
+                        .create_index(
+                            &["embedding"],
+                            Index::IvfPq(IvfPqIndexBuilder::default()),
+                        )
+                        .replace(false)
+                        .execute()
+                        .await
+                    {
+                        Ok(()) => info!("IVF-PQ ANN index created on embedding column"),
+                        // `replace(false)` causes lancedb to return a `Lance` error when
+                        // the index already exists; that is the expected steady-state.
+                        // `lance::Error` is opaque so we use message inspection only
+                        // within this specific variant; all other variants are real errors.
+                        Err(lancedb::Error::Lance { ref source })
+                            if source.to_string().contains("already exists") =>
+                        {
+                            debug!("IVF-PQ ANN index already exists, skipping creation");
+                        }
+                        Err(e) => {
+                            warn!("failed to create IVF-PQ ANN index: {e}");
+                        }
+                    }
+                }
+                Ok(row_count) => {
+                    debug!(
+                        rows = row_count,
+                        needed = MIN_INDEX_ROWS,
+                        "skipping ANN index: not enough rows yet"
+                    );
+                }
+                Err(e) => {
+                    warn!("could not count rows for ANN index decision: {e}");
+                }
+            }
         }
 
         // Initialise fastembed in a blocking thread — model download may take a while.
@@ -130,8 +278,12 @@ impl VectorStore {
 
         Ok(Self {
             conn,
-            embedder: Arc::new(Mutex::new(embedder)),
+            table,
+            embedder: Arc::new(EmbedderPool::new(vec![embedder])),
             schema,
+            cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(EMBED_CACHE_MAX).expect("EMBED_CACHE_MAX is non-zero"),
+            ))),
         })
     }
 
@@ -143,48 +295,31 @@ impl VectorStore {
         text: &str,
         limit: usize,
     ) -> Result<Vec<ChannelRecord>> {
-        let text = text.to_string();
-        let embedder = Arc::clone(&self.embedder);
+        validate_channel_id(channel_id)?;
 
-        let embedding: Vec<f32> = tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
-            let guard = embedder.lock().expect("embedder mutex poisoned");
-            let mut vecs = guard
-                .embed(vec![text], None)
-                .context("embedding query text failed")?;
-            Ok(vecs.swap_remove(0))
-        })
-        .await
-        .context("embedding task panicked")??;
+        let embedding = self
+            .embed_texts(&[text.to_string()])
+            .await?
+            .swap_remove(0);
 
-        let channel_id = channel_id.to_string();
-        let table = self
-            .conn
-            .open_table(TABLE_CHANNEL_SUMMARIES)
-            .execute()
+        // Filter to records belonging to this channel before the ANN search.
+        // channel_id has been validated above so no quoting is required, but
+        // we keep the single-quote delimiters required by LanceDB's SQL dialect.
+        let filter = format!("channel_id = '{channel_id}'");
+
+        let channel_count = self
+            .table
+            .count_rows(Some(filter.clone()))
             .await
-            .context("failed to open channel_summaries table")?;
-
-        let row_count = table
-            .count_rows(None)
-            .await
-            .context("failed to count rows")?;
-
-        if row_count == 0 {
-            debug!("vector store is empty, skipping query");
-            return Ok(Vec::new());
-        }
-
-        // Filter to records belonging to this channel before ANN search.
-        let filter = format!("channel_id = '{}'", channel_id.replace('\'', "''"));
-
-        let channel_count = table.count_rows(Some(filter.clone())).await.unwrap_or(0);
+            .context("failed to count historical records for channel")?;
 
         if channel_count == 0 {
             debug!(channel_id = %channel_id, "no historical records for channel");
             return Ok(Vec::new());
         }
 
-        let batches: Vec<RecordBatch> = table
+        let batches: Vec<RecordBatch> = self
+            .table
             .query()
             .only_if(filter)
             .nearest_to(embedding.as_slice())
@@ -206,43 +341,83 @@ impl VectorStore {
 
     /// Embed `record.summary` and persist `record` to the vector store.
     pub async fn upsert(&self, record: ChannelRecord) -> Result<()> {
-        let summary_text = record.summary.clone();
-        let embedder = Arc::clone(&self.embedder);
+        self.batch_upsert(vec![record]).await
+    }
 
-        let embedding: Vec<f32> = tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
-            let guard = embedder.lock().expect("embedder mutex poisoned");
-            let mut vecs = guard
-                .embed(vec![summary_text], None)
-                .context("embedding summary failed")?;
-            Ok(vecs.swap_remove(0))
-        })
-        .await
-        .context("embedding task panicked")??;
+    /// Embed all record summaries in a single ONNX batch call and persist every
+    /// record to the vector store in one `merge_insert` operation.
+    ///
+    /// Embeddings for texts already held in the in-memory cache are reused
+    /// without re-running inference.  Only the truly novel texts are passed to
+    /// the embedder pool.
+    pub async fn batch_upsert(&self, records: Vec<ChannelRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let texts: Vec<String> = records.iter().map(|r| r.summary.clone()).collect();
+        let embeddings = self.embed_texts(&texts).await?;
 
         let schema = Arc::clone(&self.schema);
-        let batch = record_to_batch(&record, &embedding, &schema)?;
-
-        let table = self
-            .conn
-            .open_table(TABLE_CHANNEL_SUMMARIES)
-            .execute()
-            .await
-            .context("failed to open channel_summaries table for upsert")?;
+        let batch = records_to_batch(&records, &embeddings, &schema)?;
 
         let iter = RecordBatchIterator::new(vec![Ok(batch)], Arc::clone(&schema));
 
-        // Upsert: update row if same id exists, insert otherwise.
-        let mut merge = table.merge_insert(&["id"]);
+        let mut merge = self.table.merge_insert(&["id"]);
         merge
             .when_matched_update_all(None)
             .when_not_matched_insert_all();
         merge
             .execute(Box::new(iter))
             .await
-            .context("failed to upsert record into vector store")?;
+            .context("failed to batch upsert records into vector store")?;
 
-        debug!(id = %record.id, channel = %record.channel_name, "upserted record");
+        debug!(count = records.len(), "batch upserted records");
         Ok(())
+    }
+
+    /// Split `messages` into chunks of [`CHUNK_SIZE`] and store each chunk as a
+    /// separate embedding record, using the raw chunk text as the embedding
+    /// input.
+    ///
+    /// Embedding the raw message text (rather than the LLM summary) lets the
+    /// vector search find historical discussions that are semantically similar to
+    /// the current conversation, not just similar-sounding summaries.
+    ///
+    /// `llm_summary` is stored in `raw_insight` so that
+    /// [`VectorStore::format_context`] can surface a concise human-readable
+    /// insight rather than raw message fragments when building the LLM prompt.
+    pub async fn store_thread_chunks(
+        &self,
+        channel_id: &str,
+        channel_name: &str,
+        timestamp_ms: i64,
+        messages: &[String],
+        llm_summary: &str,
+    ) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        validate_channel_id(channel_id)?;
+
+        let records: Vec<ChannelRecord> = messages
+            .chunks(CHUNK_SIZE)
+            .enumerate()
+            .map(|(i, chunk)| ChannelRecord {
+                id: record_id(&format!("{channel_id}-chunk-{i}"), timestamp_ms),
+                channel_id: channel_id.to_string(),
+                channel_name: channel_name.to_string(),
+                timestamp_ms,
+                summary: chunk.join("\n"),
+                topics: String::new(),
+                raw_insight: llm_summary.to_string(),
+                risk_score: 0.0,
+                importance_score: 0.0,
+            })
+            .collect();
+
+        self.batch_upsert(records).await
     }
 
     /// Format retrieved records as a markdown-style context string for the LLM prompt.
@@ -256,16 +431,97 @@ impl VectorStore {
                 .ok()
                 .map(|t| t.strftime("%Y-%m-%d").to_string())
                 .unwrap_or_else(|| "unknown date".to_string());
+            // Prefer the LLM summary stored in raw_insight (set by store_thread_chunks);
+            // fall back to summary for legacy records where raw_insight held raw JSON.
+            let display = if r.raw_insight.is_empty() {
+                &r.summary
+            } else {
+                &r.raw_insight
+            };
             // Truncate long summaries so the context block stays under ~1000 tokens
-            let excerpt: String = r.summary.chars().take(600).collect();
-            let ellipsis = if r.summary.len() > 600 { "…" } else { "" };
+            let excerpt: String = display.chars().take(600).collect();
+            let ellipsis = if display.len() > 600 { "…" } else { "" };
             out.push_str(&format!("{}. [{}] {}{}\n", i + 1, ts, excerpt, ellipsis));
         }
         out
     }
+
+    // ─── Internal helpers ────────────────────────────────────────────────────
+
+    /// Embed `texts`, returning one vector per input string.
+    ///
+    /// Texts already present in the in-memory LRU cache are returned
+    /// immediately (and promoted to most-recently-used).  The remaining texts
+    /// are embedded together in a single batch call to the pool and then
+    /// inserted into the LRU cache before returning.  The cache is bounded by
+    /// [`EMBED_CACHE_MAX`]; `LruCache` automatically evicts the least-recently-
+    /// used entry whenever the cap would be exceeded.
+    async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut result: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        let mut uncached: Vec<(usize, String)> = Vec::new();
+
+        {
+            // `mut` is required because `LruCache::get` takes `&mut self`
+            // to update access ordering (LRU promotion on cache hit).
+            let mut guard = self.cache.lock().expect("embed cache mutex poisoned");
+            for (i, text) in texts.iter().enumerate() {
+                if let Some(v) = guard.get(text.as_str()) {
+                    result[i] = Some(v.clone());
+                } else {
+                    uncached.push((i, text.clone()));
+                }
+            }
+        }
+
+        if !uncached.is_empty() {
+            let batch_texts: Vec<String> = uncached.iter().map(|(_, t)| t.clone()).collect();
+            let embeddings = self.embedder.embed_batch(batch_texts).await?;
+
+            let mut guard = self.cache.lock().expect("embed cache mutex poisoned");
+            // LruCache automatically evicts the least-recently-used entry when
+            // the capacity would be exceeded; no manual eviction needed.
+            for ((i, text), embedding) in uncached.into_iter().zip(embeddings.into_iter()) {
+                guard.put(text, embedding.clone());
+                result[i] = Some(embedding);
+            }
+        }
+
+        result
+            .into_iter()
+            .enumerate()
+            .map(|(i, opt)| {
+                opt.ok_or_else(|| anyhow::anyhow!("missing embedding at position {i}"))
+            })
+            .collect()
+    }
 }
 
-/// Compute a stable record ID: first 16 hex chars of a simple hash of channel_id + timestamp.
+// ─── Channel ID validation ──────────────────────────────────────────────────
+
+/// Validate that `channel_id` is safe for use as a literal value in a LanceDB
+/// SQL filter string.
+///
+/// Mattermost channel IDs are 26-character lowercase alphanumeric strings.
+/// Hyphens and underscores are explicitly allowed here because synthetic chunk
+/// IDs (produced by [`VectorStore::store_thread_chunks`]) append `-chunk-N` to
+/// the original Mattermost ID.  Anything else is rejected to prevent SQL injection
+/// even after the single-quote delimiters used in the filter expression.
+fn validate_channel_id(channel_id: &str) -> Result<()> {
+    if channel_id.is_empty() {
+        anyhow::bail!("channel_id must not be empty");
+    }
+    if channel_id.len() > 64 {
+        anyhow::bail!("channel_id is too long ({} chars)", channel_id.len());
+    }
+    if !channel_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        anyhow::bail!("channel_id contains invalid characters: {channel_id}");
+    }
+    Ok(())
+}
+
 pub fn record_id(channel_id: &str, timestamp_ms: i64) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -301,28 +557,67 @@ fn channel_summaries_schema() -> Schema {
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
-fn record_to_batch(
-    record: &ChannelRecord,
-    embedding: &[f32],
+/// Build a multi-row [`RecordBatch`] from `records` and their pre-computed `embeddings`.
+fn records_to_batch(
+    records: &[ChannelRecord],
+    embeddings: &[Vec<f32>],
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     let embedding_list = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-        std::iter::once(Some(embedding.iter().map(|&v| Some(v)).collect::<Vec<_>>())),
+        embeddings
+            .iter()
+            .map(|emb| Some(emb.iter().map(|&v| Some(v)).collect::<Vec<_>>())),
         EMBED_DIM,
     );
 
     RecordBatch::try_new(
         Arc::clone(schema),
         vec![
-            Arc::new(StringArray::from(vec![record.id.as_str()])),
-            Arc::new(StringArray::from(vec![record.channel_id.as_str()])),
-            Arc::new(StringArray::from(vec![record.channel_name.as_str()])),
-            Arc::new(Int64Array::from(vec![record.timestamp_ms])),
-            Arc::new(StringArray::from(vec![record.summary.as_str()])),
-            Arc::new(StringArray::from(vec![record.topics.as_str()])),
-            Arc::new(StringArray::from(vec![record.raw_insight.as_str()])),
-            Arc::new(Float32Array::from(vec![record.risk_score])),
-            Arc::new(Float32Array::from(vec![record.importance_score])),
+            Arc::new(StringArray::from(
+                records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|r| r.channel_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|r| r.channel_name.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                records.iter().map(|r| r.timestamp_ms).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|r| r.summary.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|r| r.topics.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|r| r.raw_insight.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Float32Array::from(
+                records.iter().map(|r| r.risk_score).collect::<Vec<_>>(),
+            )),
+            Arc::new(Float32Array::from(
+                records
+                    .iter()
+                    .map(|r| r.importance_score)
+                    .collect::<Vec<_>>(),
+            )),
             Arc::new(embedding_list),
         ],
     )
@@ -402,5 +697,53 @@ mod tests {
         assert!(schema.field_with_name("embedding").is_ok());
         assert!(schema.field_with_name("channel_id").is_ok());
         assert!(schema.field_with_name("summary").is_ok());
+    }
+
+    #[test]
+    fn validate_channel_id_accepts_valid_ids() {
+        assert!(validate_channel_id("abc123").is_ok());
+        assert!(validate_channel_id("ch-id_42").is_ok());
+        assert!(validate_channel_id("ABCD1234efgh5678ijkl9012mn").is_ok());
+    }
+
+    #[test]
+    fn validate_channel_id_rejects_invalid_ids() {
+        assert!(validate_channel_id("").is_err());
+        assert!(validate_channel_id("chan'id").is_err());
+        assert!(validate_channel_id("chan id").is_err());
+        assert!(validate_channel_id("chan;DROP").is_err());
+        assert!(validate_channel_id(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn records_to_batch_builds_multi_row_batch() {
+        let schema = Arc::new(channel_summaries_schema());
+        let records = vec![
+            ChannelRecord {
+                id: "id1".to_string(),
+                channel_id: "ch1".to_string(),
+                channel_name: "Channel 1".to_string(),
+                timestamp_ms: 1_000,
+                summary: "summary one".to_string(),
+                topics: "[]".to_string(),
+                raw_insight: "".to_string(),
+                risk_score: 0.0,
+                importance_score: 0.0,
+            },
+            ChannelRecord {
+                id: "id2".to_string(),
+                channel_id: "ch1".to_string(),
+                channel_name: "Channel 1".to_string(),
+                timestamp_ms: 2_000,
+                summary: "summary two".to_string(),
+                topics: "[]".to_string(),
+                raw_insight: "insight".to_string(),
+                risk_score: 0.1,
+                importance_score: 0.2,
+            },
+        ];
+        let embeddings = vec![vec![0.0_f32; 768], vec![1.0_f32; 768]];
+        let batch = records_to_batch(&records, &embeddings, &schema).unwrap();
+        assert_eq!(batch.num_rows(), 2);
     }
 }
