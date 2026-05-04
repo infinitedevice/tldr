@@ -41,10 +41,11 @@ use lancedb::Connection;
 use lancedb::Table;
 use lancedb::index::{Index, vector::IvfPqIndexBuilder};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use std::collections::HashMap;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Embedding dimension for NomicEmbedTextV15.
 const EMBED_DIM: i32 = 768;
@@ -154,8 +155,8 @@ pub struct VectorStore {
     table: Table,
     embedder: Arc<EmbedderPool>,
     schema: SchemaRef,
-    /// Bounded in-memory cache: text → embedding vector.
-    cache: Arc<Mutex<HashMap<String, Vec<f32>>>>,
+    /// Bounded in-memory LRU cache: text → embedding vector.
+    cache: Arc<Mutex<LruCache<String, Vec<f32>>>>,
 }
 
 impl VectorStore {
@@ -227,7 +228,14 @@ impl VectorStore {
                         Ok(()) => info!("IVF-PQ ANN index created on embedding column"),
                         // `replace(false)` causes an error when the index already exists;
                         // that is the expected steady-state after the first successful run.
-                        Err(e) => debug!("ANN index already exists, skipping creation: {e}"),
+                        Err(e) => {
+                            let msg = e.to_string().to_lowercase();
+                            if msg.contains("already exist") || msg.contains("already exists") {
+                                debug!("IVF-PQ ANN index already exists, skipping creation");
+                            } else {
+                                warn!("failed to create IVF-PQ ANN index (non-trivial error): {e}");
+                            }
+                        }
                     }
                 }
                 Ok(row_count) => {
@@ -238,7 +246,7 @@ impl VectorStore {
                     );
                 }
                 Err(e) => {
-                    debug!("could not count rows for ANN index decision: {e}");
+                    warn!("could not count rows for ANN index decision: {e}");
                 }
             }
         }
@@ -271,7 +279,9 @@ impl VectorStore {
             table,
             embedder: Arc::new(EmbedderPool::new(vec![embedder])),
             schema,
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(EMBED_CACHE_MAX).expect("EMBED_CACHE_MAX is non-zero"),
+            ))),
         })
     }
 
@@ -299,7 +309,7 @@ impl VectorStore {
             .table
             .count_rows(Some(filter.clone()))
             .await
-            .unwrap_or(0);
+            .context("failed to count historical records for channel")?;
 
         if channel_count == 0 {
             debug!(channel_id = %channel_id, "no historical records for channel");
@@ -438,17 +448,18 @@ impl VectorStore {
 
     /// Embed `texts`, returning one vector per input string.
     ///
-    /// Texts already present in the in-memory cache are returned immediately.
-    /// The remaining texts are embedded together in a single batch call to the
-    /// pool and then stored in the cache before returning.  The cache is bounded
-    /// by [`EMBED_CACHE_MAX`]; when an insert would exceed the cap, the oldest
-    /// entries are evicted to make room.
+    /// Texts already present in the in-memory LRU cache are returned
+    /// immediately (and promoted to most-recently-used).  The remaining texts
+    /// are embedded together in a single batch call to the pool and then
+    /// inserted into the LRU cache before returning.  The cache is bounded by
+    /// [`EMBED_CACHE_MAX`]; `LruCache` automatically evicts the least-recently-
+    /// used entry whenever the cap would be exceeded.
     async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut result: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
         let mut uncached: Vec<(usize, String)> = Vec::new();
 
         {
-            let guard = self.cache.lock().expect("embed cache mutex poisoned");
+            let mut guard = self.cache.lock().expect("embed cache mutex poisoned");
             for (i, text) in texts.iter().enumerate() {
                 if let Some(v) = guard.get(text.as_str()) {
                     result[i] = Some(v.clone());
@@ -463,23 +474,10 @@ impl VectorStore {
             let embeddings = self.embedder.embed_batch(batch_texts).await?;
 
             let mut guard = self.cache.lock().expect("embed cache mutex poisoned");
-            // Evict entries if the new batch would push the cache over capacity.
-            // `retain` makes a single O(n) pass, avoiding repeated rehashing.
-            let new_total = guard.len() + embeddings.len();
-            if new_total > EMBED_CACHE_MAX {
-                let excess = new_total - EMBED_CACHE_MAX;
-                let mut removed = 0_usize;
-                guard.retain(|_, _| {
-                    if removed < excess {
-                        removed += 1;
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
+            // LruCache automatically evicts the least-recently-used entry when
+            // the capacity would be exceeded; no manual eviction needed.
             for ((i, text), embedding) in uncached.into_iter().zip(embeddings.into_iter()) {
-                guard.insert(text, embedding.clone());
+                guard.put(text, embedding.clone());
                 result[i] = Some(embedding);
             }
         }
