@@ -595,11 +595,34 @@ pub async fn handle_seeding_status(State(state): State<Arc<AppState>>) -> impl I
 // ── Summaries (cached + SSE) ────────────────────────────────────────────
 
 /// Return the in-memory summary cache instantly (no LLM calls).
+///
+/// Action items are re-hydrated from the live store on every request so that
+/// ignore/resolve changes made via PATCH are reflected immediately without
+/// waiting for the next summarisation cycle.
 pub async fn handle_summaries_cached(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cache = state.summary_cache.read().await;
+    let summaries: Vec<crate::output::ChannelSummary> = if let Some(store) = &state.store {
+        cache
+            .iter()
+            .map(|s| {
+                let action_items = store
+                    .get_pending_action_items(&s.channel_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|a| crate::output::ActionItemSummary { id: a.id, text: a.text })
+                    .collect();
+                crate::output::ChannelSummary {
+                    action_items,
+                    ..s.clone()
+                }
+            })
+            .collect()
+    } else {
+        cache.clone()
+    };
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "summaries": *cache })),
+        Json(serde_json::json!({ "ok": true, "summaries": summaries })),
     )
 }
 
