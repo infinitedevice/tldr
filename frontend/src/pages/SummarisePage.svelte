@@ -229,6 +229,27 @@
     }
   }
 
+  async function onDisableChannel(
+    channelId: string,
+    channelName: string,
+    teamName: string,
+  ) {
+    // Optimistically remove from view
+    dismissedChannelIds = new Set([...dismissedChannelIds, channelId]);
+    summaries = summaries.filter((s) => s.channel_id !== channelId);
+    // Persist to DB via sources PATCH
+    await fetch("/api/v1/config/sources", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        mattermost: {
+          teams: [],
+          channels: [{ name: channelName, team: teamName, enabled: false }],
+        },
+      }),
+    }).catch(() => {});
+  }
+
   function onActionItemUpdate() {
     // Merge action item state in-place: only update action_items per channel,
     // never re-sort or replace the full array — preserves scroll position and order.
@@ -366,6 +387,7 @@
         {onActionItemUpdate}
         {onMarkRead}
         {onToggleFavourite}
+        {onDisableChannel}
       />
     </section>
   {/each}

@@ -47,6 +47,7 @@
     onActionItemUpdate,
     onMarkRead,
     onToggleFavourite,
+    onDisableChannel,
   }: {
     summaries: Summary[];
     favouriteIds?: Set<string>;
@@ -57,7 +58,15 @@
       channelName: string,
       teamName: string,
     ) => void;
+    onDisableChannel?: (
+      channelId: string,
+      channelName: string,
+      teamName: string,
+    ) => void;
   } = $props();
+
+  // Track which card is in "confirm disable" mode
+  let confirmingDisableId: string | null = $state(null);
 
   async function markRead(channelId: string) {
     try {
@@ -68,6 +77,19 @@
     } catch {
       // Non-fatal: watermark will catch up on next run
     }
+  }
+
+  function requestDisable(channelId: string) {
+    confirmingDisableId = channelId;
+  }
+
+  function cancelDisable() {
+    confirmingDisableId = null;
+  }
+
+  function confirmDisable(channelId: string, channelName: string, teamName: string) {
+    confirmingDisableId = null;
+    onDisableChannel?.(channelId, channelName, teamName);
   }
 </script>
 
@@ -115,6 +137,33 @@
                 ? `Remove #${s.channel_name} from favourites`
                 : `Add #${s.channel_name} to favourites`}>★</button
             >
+            <!-- Disable channel button / inline confirm -->
+            {#if confirmingDisableId === s.channel_id}
+              <span class="flex items-center gap-1 text-xs ml-1">
+                <span class="text-gray-400">Disable?</span>
+                <button
+                  onclick={() => confirmDisable(s.channel_id, s.channel_name, s.team_name)}
+                  class="text-red-400 hover:text-red-300 font-medium transition-colors"
+                >Yes</button>
+                <span class="text-gray-600">/</span>
+                <button
+                  onclick={cancelDisable}
+                  class="text-gray-400 hover:text-gray-200 transition-colors"
+                >No</button>
+              </span>
+            {:else}
+              <button
+                onclick={() => requestDisable(s.channel_id)}
+                class="text-gray-700 hover:text-red-400 transition-colors"
+                title="Disable #{s.channel_name}"
+                aria-label="Disable #{s.channel_name}"
+              >
+                <svg viewBox="0 0 24 24" class="w-3.5 h-3.5 fill-none stroke-current" stroke-width="2" stroke-linecap="round">
+                  <circle cx="12" cy="12" r="10"/>
+                  <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>
+                </svg>
+              </button>
+            {/if}
           </div>
 
           <!-- DM / group topic subtitle -->

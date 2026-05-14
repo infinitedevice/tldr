@@ -52,6 +52,9 @@
   let error: string | null = $state(null);
   let eventSource: EventSource | null = null;
 
+  // Which mailbox card is in "confirm disable" mode
+  let confirmingDisableMailbox: string | null = $state(null);
+
   function mergeSummary(incoming: EmailSummary) {
     if (dismissedMailboxes.has(incoming.mailbox)) return;
     const idx = summaries.findIndex((s) => s.mailbox === incoming.mailbox);
@@ -116,6 +119,19 @@
     } catch {
       // Non-fatal
     }
+  }
+
+  async function disableMailbox(mailbox: string) {
+    confirmingDisableMailbox = null;
+    dismissedMailboxes = new Set([...dismissedMailboxes, mailbox]);
+    summaries = summaries.filter((s) => s.mailbox !== mailbox);
+    await fetch("/api/v1/config/sources", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: { mailboxes: [{ name: mailbox, enabled: false }] },
+      }),
+    }).catch(() => {});
   }
 
   function onActionItemUpdate(mailboxId: string) {
@@ -233,6 +249,33 @@
               >
                 Mark as read
               </button>
+              <!-- Disable mailbox / inline confirm -->
+              {#if confirmingDisableMailbox === s.mailbox}
+                <span class="flex items-center gap-1 text-xs">
+                  <span class="text-gray-400">Disable?</span>
+                  <button
+                    onclick={() => disableMailbox(s.mailbox)}
+                    class="text-red-400 hover:text-red-300 font-medium transition-colors"
+                  >Yes</button>
+                  <span class="text-gray-600">/</span>
+                  <button
+                    onclick={() => (confirmingDisableMailbox = null)}
+                    class="text-gray-400 hover:text-gray-200 transition-colors"
+                  >No</button>
+                </span>
+              {:else}
+                <button
+                  onclick={() => (confirmingDisableMailbox = s.mailbox)}
+                  class="text-gray-600 hover:text-red-400 transition-colors"
+                  title="Disable {s.mailbox}"
+                  aria-label="Disable {s.mailbox}"
+                >
+                  <svg viewBox="0 0 24 24" class="w-3.5 h-3.5 fill-none stroke-current" stroke-width="2" stroke-linecap="round">
+                    <circle cx="12" cy="12" r="10"/>
+                    <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>
+                  </svg>
+                </button>
+              {/if}
             </div>
           </div>
 
