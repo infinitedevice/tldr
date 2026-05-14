@@ -11,7 +11,49 @@
 //! different model backends (Qwen, GPT-4o, etc.).
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+/// Strip markdown code fences and attempt to deserialise the LLM's raw text as
+/// `T`.  Tries three passes in order:
+///
+/// 1. Parse the raw text directly (fast path when the model behaves).
+/// 2. Strip leading ` ```json ` / ` ``` ` and trailing ` ``` ` fences, then parse.
+/// 3. Find the first `{` and last `}` in the (possibly fence-stripped) text and
+///    parse just that substring — catches responses where the model emits a
+///    preamble sentence or a stray character outside the JSON object.
+///
+/// Returns `None` only if all three passes fail.
+fn try_parse_llm_json<T: DeserializeOwned>(raw: &str) -> Option<T> {
+    // Pass 1: direct parse
+    if let Ok(v) = serde_json::from_str(raw) {
+        return Some(v);
+    }
+
+    // Strip fences
+    let s = raw.trim();
+    let s = s
+        .strip_prefix("```json")
+        .or_else(|| s.strip_prefix("```"))
+        .unwrap_or(s)
+        .trim();
+    let stripped = s.strip_suffix("```").unwrap_or(s).trim();
+
+    // Pass 2: parse after fence stripping
+    if let Ok(v) = serde_json::from_str(stripped) {
+        return Some(v);
+    }
+
+    // Pass 3: scan for the outermost JSON object boundaries
+    if let (Some(start), Some(end)) = (stripped.find('{'), stripped.rfind('}')) {
+        if start <= end {
+            if let Ok(v) = serde_json::from_str(&stripped[start..=end]) {
+                return Some(v);
+            }
+        }
+    }
+
+    None
+}
 
 #[derive(Clone)]
 pub struct LlmClient {
@@ -285,20 +327,8 @@ impl LlmClient {
             .map(|c| c.message.content.trim().to_string())
             .unwrap_or_default();
 
-        // Strip markdown code fences that some LLMs wrap around their JSON response,
-        // e.g.  ```json\n{"summary":...}\n```
-        let stripped = {
-            let s = raw.trim();
-            let s = s
-                .strip_prefix("```json")
-                .or_else(|| s.strip_prefix("```"))
-                .unwrap_or(s)
-                .trim();
-            s.strip_suffix("```").unwrap_or(s).trim()
-        };
-
-        // Parse the (possibly stripped) JSON; fall back to raw text if parsing still fails
-        let result = serde_json::from_str::<LlmSummary>(stripped).unwrap_or_else(|_| LlmSummary {
+        // Strip fences / extract JSON; fall back to raw text if all passes fail.
+        let result = try_parse_llm_json::<LlmSummary>(&raw).unwrap_or_else(|| LlmSummary {
             topics: vec![TopicPoint {
                 title: "Summary".into(),
                 summary: raw.clone(),
@@ -405,17 +435,7 @@ impl LlmClient {
             .map(|c| c.message.content.trim().to_string())
             .unwrap_or_default();
 
-        let stripped = {
-            let s = raw.trim();
-            let s = s
-                .strip_prefix("```json")
-                .or_else(|| s.strip_prefix("```"))
-                .unwrap_or(s)
-                .trim();
-            s.strip_suffix("```").unwrap_or(s).trim()
-        };
-
-        let result = serde_json::from_str::<LlmSummary>(stripped).unwrap_or_else(|_| LlmSummary {
+        let result = try_parse_llm_json::<LlmSummary>(&raw).unwrap_or_else(|| LlmSummary {
             topics: vec![TopicPoint {
                 title: "Summary".into(),
                 summary: raw.clone(),
@@ -499,21 +519,83 @@ impl LlmClient {
             .map(|c| c.message.content.trim().to_string())
             .unwrap_or_default();
 
-        let stripped = {
-            let s = raw.trim();
-            let s = s
-                .strip_prefix("```json")
-                .or_else(|| s.strip_prefix("```"))
-                .unwrap_or(s)
-                .trim();
-            s.strip_suffix("```").unwrap_or(s).trim()
-        };
-
         Ok(
-            serde_json::from_str::<InsightsSummary>(stripped).unwrap_or_else(|_| InsightsSummary {
+            try_parse_llm_json::<InsightsSummary>(&raw).unwrap_or_else(|| InsightsSummary {
                 synthesis: raw,
                 ..Default::default()
             }),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_clean_json() {
+        let raw = r#"{"summary":"All good","action_items":[]}"#;
+        let r: Option<LlmSummary> = try_parse_llm_json(raw);
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().summary, "All good");
+    }
+
+    #[test]
+    fn parse_json_fenced_with_json_tag() {
+        let raw = "```json\n{\"summary\":\"fenced\",\"action_items\":[]}\n```";
+        let r: Option<LlmSummary> = try_parse_llm_json(raw);
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().summary, "fenced");
+    }
+
+    #[test]
+    fn parse_json_fenced_without_tag() {
+        let raw = "```\n{\"summary\":\"bare\",\"action_items\":[]}\n```";
+        let r: Option<LlmSummary> = try_parse_llm_json(raw);
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().summary, "bare");
+    }
+
+    #[test]
+    fn parse_json_with_preamble_and_trailing_text() {
+        let raw = "Here is the summary:\n{\"summary\":\"preamble\",\"action_items\":[]}\nDone.";
+        let r: Option<LlmSummary> = try_parse_llm_json(raw);
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().summary, "preamble");
+    }
+
+    #[test]
+    fn parse_invalid_json_returns_none() {
+        let r: Option<LlmSummary> = try_parse_llm_json("not json at all");
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn parse_action_items_plain_strings() {
+        let raw = r#"{"summary":"ok","action_items":["Task A","Task B"]}"#;
+        let r: Option<LlmSummary> = try_parse_llm_json(raw);
+        assert!(r.is_some());
+        let items = r.unwrap().action_items;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "Task A");
+        assert!(items[0].source_ids.is_empty());
+    }
+
+    #[test]
+    fn parse_action_items_with_source_ids() {
+        let raw = r#"{"summary":"ok","action_items":[{"text":"Fix it","source_ids":["msg1","msg2"]}]}"#;
+        let r: Option<LlmSummary> = try_parse_llm_json(raw);
+        assert!(r.is_some());
+        let item = &r.unwrap().action_items[0];
+        assert_eq!(item.text, "Fix it");
+        assert_eq!(item.source_ids, vec!["msg1", "msg2"]);
+    }
+
+    #[test]
+    fn parse_summary_as_array_of_strings() {
+        let raw = r#"{"summary":["line one","line two"],"action_items":[]}"#;
+        let r: Option<LlmSummary> = try_parse_llm_json(raw);
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().summary, "line one\nline two");
     }
 }
