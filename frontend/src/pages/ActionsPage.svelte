@@ -73,11 +73,32 @@
 
   async function loadData() {
     loading = true;
+    await refreshData();
+    loading = false;
+  }
+
+  async function refreshData() {
     await Promise.allSettled([
       fetch("/api/v1/summaries")
         .then((r) => (r.ok ? r.json() : null))
         .then((d: { summaries?: Summary[] } | null) => {
-          if (d?.summaries) summaries = d.summaries;
+          if (d?.summaries) {
+            // Merge action_items in-place to avoid re-ordering channels
+            const freshMap = new Map(
+              d.summaries.map((s: Summary) => [s.channel_id, s.action_items]),
+            );
+            summaries = summaries.map((s) => {
+              const freshItems = freshMap.get(s.channel_id);
+              return freshItems !== undefined
+                ? { ...s, action_items: freshItems }
+                : s;
+            });
+            // Add any newly appeared channels (shouldn't happen often in Actions view)
+            const existing = new Set(summaries.map((s) => s.channel_id));
+            for (const s of d.summaries) {
+              if (!existing.has(s.channel_id)) summaries = [...summaries, s];
+            }
+          }
         }),
       fetch("/api/v1/action-items")
         .then((r) => (r.ok ? r.json() : null))
@@ -85,7 +106,6 @@
           if (d?.items) allItems = d.items;
         }),
     ]);
-    loading = false;
   }
 
   onMount(loadData);
@@ -96,7 +116,7 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action }),
     });
-    await loadData();
+    await refreshData();
   }
 </script>
 
@@ -221,7 +241,7 @@
               <ActionItemsList
                 channelId={s.channel_id}
                 items={s.action_items}
-                onupdate={loadData}
+                onupdate={refreshData}
               />
             </article>
           {/each}

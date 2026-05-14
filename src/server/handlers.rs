@@ -350,13 +350,20 @@ pub async fn handle_channel_mark_read(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let now = jiff::Timestamp::now().as_millisecond();
-    match store.set_watermark(&channel_id, now) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            warn!("mark-read error for {channel_id}: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+    if let Err(e) = store.set_watermark(&channel_id, now) {
+        warn!("mark-read error for {channel_id}: {e:#}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    // Evict from SQLite cache so the channel doesn't reappear on next GET
+    if let Err(e) = store.remove_cached_summary(&channel_id) {
+        warn!("mark-read: failed to remove cached summary for {channel_id}: {e:#}");
+    }
+    // Evict from the in-memory summary_cache so SSE and GET don't bring it back
+    {
+        let mut cache = state.summary_cache.write().await;
+        cache.retain(|s| s.channel_id != channel_id);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 // ── Insights ────────────────────────────────────────────────────────────
