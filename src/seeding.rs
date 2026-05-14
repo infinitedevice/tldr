@@ -267,7 +267,7 @@ async fn seed_channel(
             drop(p);
         };
         match llm
-            .summarise(channel_name, &[], &window_posts, &[], &[], false, None)
+            .summarise(channel_name, &[], &window_posts, &[], &[], false, None, None)
             .await
         {
             Ok((result, _raw)) => {

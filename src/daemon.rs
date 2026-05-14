@@ -155,6 +155,59 @@ pub async fn run_daemon(config: Config, config_path: std::path::PathBuf) -> Resu
     let email_cache = std::sync::Arc::new(RwLock::new(initial_email_cache));
     let (email_tx, _) = tokio::sync::broadcast::channel::<crate::output::EmailSummary>(64);
 
+    // Initialise mutable source config from DB, seeded with config.toml entries
+    let (mm_channel_config, mm_team_config, email_mailbox_config) = {
+        // Load DB rows
+        let db_channels: Vec<crate::config::MmChannelConfig> = store
+            .as_ref()
+            .and_then(|s| s.get_source_configs("mm_channel").ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| crate::config::MmChannelConfig {
+                name: r.name,
+                team: if r.team.is_empty() { None } else { Some(r.team) },
+                enabled: r.enabled,
+                instructions: r.instructions,
+            })
+            .collect();
+        let db_teams: Vec<crate::config::MmTeamConfig> = store
+            .as_ref()
+            .and_then(|s| s.get_source_configs("mm_team").ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| crate::config::MmTeamConfig {
+                name: r.name,
+                enabled: r.enabled,
+                instructions: r.instructions,
+            })
+            .collect();
+        let db_mailboxes: Vec<crate::config::MailboxConfig> = store
+            .as_ref()
+            .and_then(|s| s.get_source_configs("email_mailbox").ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| crate::config::MailboxConfig {
+                name: r.name,
+                enabled: r.enabled,
+                instructions: r.instructions,
+            })
+            .collect();
+
+        // Merge: DB as base, config.toml overrides DB (admin-set settings win)
+        let mm_channels = merge_source_configs_channels(db_channels, &config.mattermost.channels);
+        let mm_teams = merge_source_configs_teams(db_teams, &config.mattermost.teams);
+        let email_mailboxes = merge_source_configs_mailboxes(
+            db_mailboxes,
+            config.email.as_ref().map(|e| e.mailboxes.as_slice()).unwrap_or(&[]),
+        );
+
+        (
+            std::sync::Arc::new(RwLock::new(mm_channels)),
+            std::sync::Arc::new(RwLock::new(mm_teams)),
+            std::sync::Arc::new(RwLock::new(email_mailboxes)),
+        )
+    };
+
     let state = std::sync::Arc::new(AppState {
         mm,
         llm,
@@ -170,6 +223,9 @@ pub async fn run_daemon(config: Config, config_path: std::path::PathBuf) -> Resu
         summary_tx: summary_tx.clone(),
         email_cache: std::sync::Arc::clone(&email_cache),
         email_tx: email_tx.clone(),
+        mm_channel_config: std::sync::Arc::clone(&mm_channel_config),
+        mm_team_config: std::sync::Arc::clone(&mm_team_config),
+        email_mailbox_config: std::sync::Arc::clone(&email_mailbox_config),
     });
 
     let app = create_router(Arc::clone(&state));
@@ -254,6 +310,8 @@ pub async fn run_daemon(config: Config, config_path: std::path::PathBuf) -> Resu
         let server_url_bg = state.config.mattermost.server_url.clone();
         let priority_users_bg = state.config.priority_users.clone();
         let poll_interval = state.config.server.poll_interval_secs;
+        let mm_channel_config_bg = std::sync::Arc::clone(&state.mm_channel_config);
+        let mm_team_config_bg = std::sync::Arc::clone(&state.mm_team_config);
         tokio::spawn(async move {
             background_summarise_loop(
                 mm_bg,
@@ -267,6 +325,8 @@ pub async fn run_daemon(config: Config, config_path: std::path::PathBuf) -> Resu
                 server_url_bg,
                 priority_users_bg,
                 poll_interval,
+                mm_channel_config_bg,
+                mm_team_config_bg,
             )
             .await;
         });
@@ -283,6 +343,7 @@ pub async fn run_daemon(config: Config, config_path: std::path::PathBuf) -> Resu
         let cache_email_bg = std::sync::Arc::clone(&state.email_cache);
         let tx_email_bg = state.email_tx.clone();
         let poll_interval_email = state.config.server.poll_interval_secs;
+        let email_mailbox_config_bg = std::sync::Arc::clone(&state.email_mailbox_config);
         tokio::spawn(async move {
             background_email_summarise_loop(
                 email_cfg_bg,
@@ -292,6 +353,7 @@ pub async fn run_daemon(config: Config, config_path: std::path::PathBuf) -> Resu
                 cache_email_bg,
                 tx_email_bg,
                 poll_interval_email,
+                email_mailbox_config_bg,
             )
             .await;
         });
@@ -300,4 +362,57 @@ pub async fn run_daemon(config: Config, config_path: std::path::PathBuf) -> Resu
     axum::serve(listener, app).await.context("server error")?;
 
     Ok(())
+}
+
+/// Merge DB source configs with config.toml channel entries.
+/// config.toml entries win (they're admin-set); DB fills in the rest.
+fn merge_source_configs_channels(
+    db: Vec<crate::config::MmChannelConfig>,
+    cfg: &[crate::config::MmChannelConfig],
+) -> Vec<crate::config::MmChannelConfig> {
+    let mut merged = db;
+    for c in cfg {
+        let key_team = c.team.as_deref().unwrap_or("");
+        if let Some(existing) = merged.iter_mut().find(|r| {
+            r.name == c.name && r.team.as_deref().unwrap_or("") == key_team
+        }) {
+            existing.enabled = c.enabled;
+            existing.instructions = c.instructions.clone();
+        } else {
+            merged.push(c.clone());
+        }
+    }
+    merged
+}
+
+fn merge_source_configs_teams(
+    db: Vec<crate::config::MmTeamConfig>,
+    cfg: &[crate::config::MmTeamConfig],
+) -> Vec<crate::config::MmTeamConfig> {
+    let mut merged = db;
+    for c in cfg {
+        if let Some(existing) = merged.iter_mut().find(|r| r.name == c.name) {
+            existing.enabled = c.enabled;
+            existing.instructions = c.instructions.clone();
+        } else {
+            merged.push(c.clone());
+        }
+    }
+    merged
+}
+
+fn merge_source_configs_mailboxes(
+    db: Vec<crate::config::MailboxConfig>,
+    cfg: &[crate::config::MailboxConfig],
+) -> Vec<crate::config::MailboxConfig> {
+    let mut merged = db;
+    for c in cfg {
+        if let Some(existing) = merged.iter_mut().find(|r| r.name == c.name) {
+            existing.enabled = c.enabled;
+            existing.instructions = c.instructions.clone();
+        } else {
+            merged.push(c.clone());
+        }
+    }
+    merged
 }

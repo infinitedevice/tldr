@@ -26,14 +26,20 @@ pub async fn summarise_all_mailboxes(
     llm: &LlmClient,
     store: &Store,
     llm_sem: Arc<tokio::sync::Semaphore>,
+    mailboxes_override: Option<&[crate::config::MailboxConfig]>,
 ) -> Result<Vec<EmailSummary>> {
     let mut results = Vec::new();
 
-    for mailbox in &config.mailboxes {
-        match summarise_mailbox(config, llm, store, mailbox, Arc::clone(&llm_sem)).await {
+    let mailboxes = mailboxes_override.unwrap_or(&config.mailboxes);
+    for mailbox in mailboxes {
+        if !mailbox.enabled {
+            info!(mailbox = %mailbox.name, "skipping disabled mailbox");
+            continue;
+        }
+        match summarise_mailbox(config, llm, store, mailbox.name.as_str(), mailbox.instructions.as_deref(), Arc::clone(&llm_sem)).await {
             Ok(Some(s)) => results.push(s),
             Ok(None) => {}
-            Err(e) => warn!(mailbox = %mailbox, "email summarise failed: {e:#}"),
+            Err(e) => warn!(mailbox = %mailbox.name, "email summarise failed: {e:#}"),
         }
     }
 
@@ -45,6 +51,7 @@ async fn summarise_mailbox(
     llm: &LlmClient,
     store: &Store,
     mailbox: &str,
+    instructions: Option<&str>,
     llm_sem: Arc<tokio::sync::Semaphore>,
 ) -> Result<Option<EmailSummary>> {
     let since_uid = store.get_email_watermark(mailbox);
@@ -96,7 +103,7 @@ async fn summarise_mailbox(
     let _permit = llm_sem.acquire().await.context("LLM semaphore closed")?;
 
     let (llm_result, _raw) = llm
-        .summarise_emails(mailbox, &email_tuples, &prior_items)
+        .summarise_emails(mailbox, &email_tuples, &prior_items, instructions)
         .await
         .with_context(|| format!("LLM summarise_emails failed for {mailbox}"))?;
 
@@ -176,6 +183,7 @@ pub async fn background_email_summarise_loop(
     email_cache: Arc<tokio::sync::RwLock<Vec<EmailSummary>>>,
     email_tx: tokio::sync::broadcast::Sender<EmailSummary>,
     poll_interval_secs: u64,
+    email_mailbox_config: Arc<tokio::sync::RwLock<Vec<crate::config::MailboxConfig>>>,
 ) {
     if poll_interval_secs == 0 {
         info!("email background loop disabled (poll_interval_secs = 0)");
@@ -193,19 +201,28 @@ pub async fn background_email_summarise_loop(
         tokio::time::sleep(interval).await;
 
         info!("email summarise: starting cycle");
-        match summarise_all_mailboxes(&config, &llm, &store, Arc::clone(&llm_sem)).await {
+        let live_mailboxes = email_mailbox_config.read().await.clone();
+        match summarise_all_mailboxes(&config, &llm, &store, Arc::clone(&llm_sem), Some(&live_mailboxes)).await {
             Ok(summaries) => {
                 info!(count = summaries.len(), "email summarise: cycle complete");
-                for s in &summaries {
-                    if let Ok(json) = serde_json::to_string(s)
+                // Merge into the existing cache instead of replacing wholesale.
+                // Mailboxes with no new unread messages are not returned by
+                // summarise_all_mailboxes, but their previous summaries should
+                // remain visible until the user marks them as read.
+                let mut cache = email_cache.write().await;
+                for s in summaries {
+                    if let Ok(json) = serde_json::to_string(&s)
                         && let Err(e) = store.set_cached_email_summary(&s.mailbox, &json)
                     {
                         warn!(mailbox = %s.mailbox, "failed to cache email summary: {e:#}");
                     }
                     let _ = email_tx.send(s.clone());
+                    if let Some(existing) = cache.iter_mut().find(|c| c.mailbox == s.mailbox) {
+                        *existing = s;
+                    } else {
+                        cache.push(s);
+                    }
                 }
-                // Replace in-memory cache
-                *email_cache.write().await = summaries;
             }
             Err(e) => warn!("email summarise cycle failed: {e:#}"),
         }

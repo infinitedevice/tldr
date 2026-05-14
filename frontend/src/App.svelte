@@ -21,9 +21,10 @@
   import InsightsPage from "./pages/InsightsPage.svelte";
   import ActionsPage from "./pages/ActionsPage.svelte";
   import EmailPage from "./pages/EmailPage.svelte";
+  import SourcesPage from "./pages/SourcesPage.svelte";
   import { startTour, startTourIfNew } from "./lib/ProductTour";
 
-  type Page = "summarise" | "insights" | "actions" | "email";
+  type Page = "summarise" | "insights" | "actions" | "email" | "sources";
 
   let currentPage: Page = $state("summarise");
   let showWizard = $state(false);
@@ -274,6 +275,23 @@
     {/snippet}
 
     {#snippet footer()}
+      <!-- Sources config button -->
+      <button
+        onclick={() => (currentPage = "sources")}
+        title="Configure sources"
+        data-tour="sources-btn"
+        class={`flex flex-col items-center gap-1 w-full px-1 py-2 rounded-lg transition-colors ${currentPage === "sources" ? "text-cyan-400 bg-gray-700/60" : "text-gray-500 hover:text-gray-300 hover:bg-gray-700/40"}`}
+      >
+        <svg viewBox="0 0 24 24" class="w-4 h-4 fill-none stroke-current" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="4" y1="6" x2="20" y2="6"/>
+          <line x1="4" y1="12" x2="14" y2="12"/>
+          <line x1="4" y1="18" x2="17" y2="18"/>
+          <circle cx="20" cy="12" r="2"/>
+          <circle cx="17" cy="18" r="2"/>
+        </svg>
+        <span class="text-[9px] leading-tight">Sources</span>
+      </button>
+
       <!-- llms.txt link -->
       <a
         href="/llms.txt"
@@ -342,7 +360,7 @@
       <span
         class="text-xs font-semibold uppercase tracking-widest text-gray-400"
       >
-        {currentPage === "summarise" ? "Summarise" : currentPage === "insights" ? "Insights" : currentPage === "actions" ? "Actions" : "Email"}
+        {currentPage === "summarise" ? "Summarise" : currentPage === "insights" ? "Insights" : currentPage === "actions" ? "Actions" : currentPage === "email" ? "Email" : "Sources"}
       </span>
 
       {#snippet trail()}
@@ -494,6 +512,9 @@
       </div>
       <div class:hidden={currentPage !== "email"}>
         <EmailPage />
+      </div>
+      <div class:hidden={currentPage !== "sources"} class="h-full">
+        <SourcesPage />
       </div>
     </main>
   </div>

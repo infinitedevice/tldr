@@ -16,6 +16,7 @@ mod handlers;
 mod state;
 mod summarise_handlers;
 mod email_handlers;
+mod sources_handlers;
 
 pub use state::{AppState, HealthState, SeedingProgress};
 
@@ -33,6 +34,7 @@ use crate::mattermost_types::{Channel, Team};
 use handlers::*;
 use summarise_handlers::*;
 use email_handlers::*;
+use sources_handlers::*;
 
 /// Enumerate all channels the bot user belongs to across all teams.
 ///
@@ -106,6 +108,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/email/{mailbox}/read",
             post(handle_email_mailbox_mark_read),
         )
+        .route("/api/v1/config/sources", get(handle_sources_get))
+        .route("/api/v1/config/sources", patch(handle_sources_patch))
+        .route("/api/v1/email/mailboxes", get(handle_email_mailboxes_list))
         .route("/llms.txt", get(handle_llms_txt))
         .route("/slash/summarise", post(handle_summarise))
         .with_state(state);

@@ -22,6 +22,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use crate::config::{MmChannelConfig, MmTeamConfig};
 use crate::llm::{FormattedMessage, LlmClient, TopicPoint};
 use crate::mattermost::MattermostClient;
 use crate::mattermost_types::{Channel, Post, Team, User};
@@ -43,6 +44,67 @@ fn format_topics_markdown(topics: &[TopicPoint], fallback: &str) -> String {
         .join("\n\n")
 }
 
+/// Returns `false` if the team is explicitly disabled in `team_configs`.
+fn team_enabled(team_configs: &[MmTeamConfig], team: &crate::mattermost_types::Team) -> bool {
+    for tc in team_configs {
+        if tc.name == team.name || tc.name == team.display_name {
+            return tc.enabled;
+        }
+    }
+    true // default: enabled
+}
+
+/// Returns `false` if the channel is explicitly disabled in `channel_configs`
+/// for this team.
+fn channel_enabled(
+    channel_configs: &[MmChannelConfig],
+    team: &crate::mattermost_types::Team,
+    channel: &crate::mattermost_types::Channel,
+) -> bool {
+    for cc in channel_configs {
+        let team_matches = cc
+            .team
+            .as_ref()
+            .map(|t| t == &team.name || t == &team.display_name)
+            .unwrap_or(true);
+        if team_matches && (cc.name == channel.name || cc.name == channel.display_name) {
+            return cc.enabled;
+        }
+    }
+    true // default: enabled
+}
+
+/// Returns per-channel instructions if configured, or falls back to team-level
+/// instructions, then `None`.
+fn channel_instructions(
+    channel_configs: &[MmChannelConfig],
+    team_configs: &[MmTeamConfig],
+    team: &crate::mattermost_types::Team,
+    channel: &crate::mattermost_types::Channel,
+) -> Option<String> {
+    // Channel-level takes precedence
+    for cc in channel_configs {
+        let team_matches = cc
+            .team
+            .as_ref()
+            .map(|t| t == &team.name || t == &team.display_name)
+            .unwrap_or(true);
+        if team_matches && (cc.name == channel.name || cc.name == channel.display_name) {
+            if cc.instructions.is_some() {
+                return cc.instructions.clone();
+            }
+            break;
+        }
+    }
+    // Fall back to team-level instructions
+    for tc in team_configs {
+        if tc.name == team.name || tc.name == team.display_name {
+            return tc.instructions.clone();
+        }
+    }
+    None
+}
+
 /// Summarise all channels with unread messages across all teams.
 ///
 /// Mattermost reads run concurrently per channel; LLM calls are serialised
@@ -57,6 +119,8 @@ pub async fn summarise_all_unread(
     priority_users: &[String],
     rag: Option<Arc<VectorStore>>,
     llm_sem: Arc<Semaphore>,
+    mm_channels: &[MmChannelConfig],
+    mm_teams: &[MmTeamConfig],
 ) -> Result<Vec<ChannelSummary>> {
     let me = mm.get_me().await.context("failed to get current user")?;
     info!(user = %me.username, id = %me.id, "authenticated as");
@@ -68,9 +132,14 @@ pub async fn summarise_all_unread(
 
     info!(count = teams.len(), "found teams");
 
-    // Collect all (team, channel) pairs before spawning
-    let mut work_items: Vec<(Team, Channel)> = Vec::new();
+    // Collect all (team, channel, instructions) triples before spawning
+    let mut work_items: Vec<(Team, Channel, Option<String>)> = Vec::new();
     for team in &teams {
+        if !team_enabled(mm_teams, team) {
+            info!(team = %team.display_name, "skipping disabled team");
+            continue;
+        }
+
         let channels = mm
             .get_channels_for_team_for_user(&me.id, &team.id)
             .await
@@ -85,14 +154,19 @@ pub async fn summarise_all_unread(
             {
                 continue;
             }
-            work_items.push((team.clone(), channel));
+            if !channel_enabled(mm_channels, team, &channel) {
+                debug!(team = %team.display_name, channel = %channel.label(), "skipping disabled channel");
+                continue;
+            }
+            let instructions = channel_instructions(mm_channels, mm_teams, team, &channel);
+            work_items.push((team.clone(), channel, instructions));
         }
     }
 
     // One permit: LLM calls serialised while Mattermost fetches run concurrently
     let mut join_set: JoinSet<Option<ChannelSummary>> = JoinSet::new();
 
-    for (team, channel) in work_items {
+    for (team, channel, instructions) in work_items {
         let mm = mm.clone();
         let llm = llm.clone();
         let store = store.cloned();
@@ -117,6 +191,7 @@ pub async fn summarise_all_unread(
                 store,
                 priority_users,
                 rag_clone,
+                instructions,
             )
             .await
             {
@@ -161,6 +236,7 @@ async fn summarise_channel(
     store: Option<Store>,
     priority_users: Vec<String>,
     rag: Option<Arc<VectorStore>>,
+    instructions: Option<String>,
 ) -> Result<Option<ChannelSummary>> {
     let unread = mm
         .get_channel_unread(&user_id, &channel.id)
@@ -337,6 +413,7 @@ async fn summarise_channel(
             &priority_users,
             is_dm,
             historical_ctx.as_deref(),
+            instructions.as_deref(),
         )
         .await
         .context("LLM summarisation failed")?;
@@ -619,6 +696,8 @@ pub async fn summarise_all_unread_stream(
     priority_users: &[String],
     rag: Option<Arc<VectorStore>>,
     llm_sem: Arc<Semaphore>,
+    mm_channels: &[MmChannelConfig],
+    mm_teams: &[MmTeamConfig],
 ) -> Result<()> {
     let me = mm.get_me().await.context("failed to get current user")?;
     info!(user = %me.username, id = %me.id, "authenticated as (stream)");
@@ -628,8 +707,12 @@ pub async fn summarise_all_unread_stream(
         .await
         .context("failed to get teams")?;
 
-    let mut work_items: Vec<(Team, Channel)> = Vec::new();
+    let mut work_items: Vec<(Team, Channel, Option<String>)> = Vec::new();
     for team in &teams {
+        if !team_enabled(mm_teams, team) {
+            continue;
+        }
+
         let channels = mm
             .get_channels_for_team_for_user(&me.id, &team.id)
             .await
@@ -642,13 +725,17 @@ pub async fn summarise_all_unread_stream(
             {
                 continue;
             }
-            work_items.push((team.clone(), channel));
+            if !channel_enabled(mm_channels, team, &channel) {
+                continue;
+            }
+            let instructions = channel_instructions(mm_channels, mm_teams, team, &channel);
+            work_items.push((team.clone(), channel, instructions));
         }
     }
 
     let mut join_set: JoinSet<Option<ChannelSummary>> = JoinSet::new();
 
-    for (team, channel) in work_items {
+    for (team, channel, instructions) in work_items {
         let mm = mm.clone();
         let llm = llm.clone();
         let store = store.cloned();
@@ -673,6 +760,7 @@ pub async fn summarise_all_unread_stream(
                 store,
                 priority_users,
                 rag,
+                instructions,
             )
             .await
             {
@@ -735,6 +823,8 @@ pub async fn background_summarise_loop(
     server_url: String,
     priority_users: Vec<String>,
     poll_interval_secs: u64,
+    mm_channel_config: Arc<tokio::sync::RwLock<Vec<MmChannelConfig>>>,
+    mm_team_config: Arc<tokio::sync::RwLock<Vec<MmTeamConfig>>>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -755,6 +845,8 @@ pub async fn background_summarise_loop(
         debug!("background summarise: starting cycle");
 
         summarise_active.fetch_add(1, Ordering::AcqRel);
+        let mm_channels = mm_channel_config.read().await.clone();
+        let mm_teams = mm_team_config.read().await.clone();
         let result = summarise_all_unread(
             &mm,
             &llm,
@@ -764,6 +856,8 @@ pub async fn background_summarise_loop(
             &priority_users,
             rag.as_ref().map(Arc::clone),
             Arc::clone(&llm_sem),
+            &mm_channels,
+            &mm_teams,
         )
         .await;
         summarise_active.fetch_sub(1, Ordering::AcqRel);

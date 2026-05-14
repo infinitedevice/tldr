@@ -135,6 +135,7 @@ impl LlmClient {
     /// - `priority_users`: @usernames whose messages should receive extra attention
     /// - `is_dm`: when true, the LLM is also asked to infer a short conversation topic
     /// - `historical_context`: optional RAG context injected before the unread messages section
+    /// - `extra_instructions`: optional per-channel instructions appended to the system prompt
     ///
     /// Returns `(LlmSummary, raw_response)` where `raw_response` is the unprocessed model output
     /// (useful for storing in the vector store as `raw_insight`).
@@ -148,6 +149,7 @@ impl LlmClient {
         priority_users: &[String],
         is_dm: bool,
         historical_context: Option<&str>,
+        extra_instructions: Option<&str>,
     ) -> Result<(LlmSummary, String)> {
         if unread_messages.is_empty() {
             return Ok((LlmSummary::default(), String::new()));
@@ -243,6 +245,14 @@ impl LlmClient {
             ));
         }
 
+        if let Some(instructions) = extra_instructions
+            && !instructions.is_empty()
+        {
+            system_prompt.push_str(&format!(
+                "\n\nAdditional context for this channel: {instructions}"
+            ));
+        }
+
         let body = serde_json::json!({
             "model": self.model,
             "messages": [
@@ -305,11 +315,13 @@ impl LlmClient {
     ///
     /// `emails` is a list of `(from, subject, date, body)` tuples.  Returns the
     /// same [`LlmSummary`] format as [`Self::summarise`], with topics and action items.
+    /// `extra_instructions` is optional per-mailbox context injected into the system prompt.
     pub async fn summarise_emails(
         &self,
         mailbox_name: &str,
         emails: &[(String, String, String, String)], // (from, subject, date, body)
         prior_action_items: &[String],
+        extra_instructions: Option<&str>,
     ) -> Result<(LlmSummary, String)> {
         if emails.is_empty() {
             return Ok((LlmSummary::default(), String::new()));
@@ -339,7 +351,7 @@ impl LlmClient {
             }
         }
 
-        let system_prompt =
+        let mut system_prompt =
             "You are a concise email summariser. \
             Summarise the provided emails, grouping related threads by topic. \
             IMPORTANT: Always include the sender's email address and the subject line when \
@@ -353,6 +365,14 @@ impl LlmClient {
             The action_items array contains only new or still-pending action items from the emails, \
             as short imperative sentences."
             .to_string();
+
+        if let Some(instructions) = extra_instructions
+            && !instructions.is_empty()
+        {
+            system_prompt.push_str(&format!(
+                "\n\nAdditional context for this mailbox: {instructions}"
+            ));
+        }
 
         let body = serde_json::json!({
             "model": self.model,

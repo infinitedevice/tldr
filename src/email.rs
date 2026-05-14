@@ -177,6 +177,34 @@ impl ImapClient {
         self.session.logout().await?;
         Ok(())
     }
+
+    /// List all mailboxes visible to the authenticated user.
+    ///
+    /// Runs `LIST "" "*"` which returns the full hierarchy. Mailboxes with
+    /// the `\Noselect` attribute are excluded (they are namespace containers,
+    /// not real mailboxes).
+    pub async fn list_mailboxes(&mut self) -> Result<Vec<String>> {
+        use futures::TryStreamExt;
+        use async_imap::types::NameAttribute;
+
+        let names: Vec<_> = self
+            .session
+            .list(None, Some("*"))
+            .await
+            .context("IMAP LIST failed")?
+            .try_collect()
+            .await
+            .context("failed to collect IMAP LIST response")?;
+
+        let mut mailboxes: Vec<String> = names
+            .iter()
+            .filter(|n| !n.attributes().contains(&NameAttribute::NoSelect))
+            .map(|n| n.name().to_string())
+            .collect();
+
+        mailboxes.sort();
+        Ok(mailboxes)
+    }
 }
 
 /// Compress a sorted list of UIDs into IMAP range notation (e.g. "1:5,7,9:12").

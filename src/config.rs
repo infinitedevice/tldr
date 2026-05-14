@@ -39,6 +39,47 @@ pub struct MattermostConfig {
     pub server_url: String,
     #[serde(default = "default_mm_token")]
     pub token: String,
+    /// Per-channel overrides: enable/disable or add instructions for a specific channel.
+    /// Absent = all channels enabled with no extra instructions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<MmChannelConfig>,
+    /// Per-team overrides: enable/disable an entire team.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub teams: Vec<MmTeamConfig>,
+}
+
+/// Per-channel configuration override for a Mattermost channel.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MmChannelConfig {
+    /// Channel slug (internal name) or display name; matched case-sensitively.
+    pub name: String,
+    /// Restrict this entry to a specific team (by slug or display name).
+    /// If absent, applies to any team that has a matching channel name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    /// Set to `false` to skip this channel entirely.
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    /// Extra context injected into the LLM system prompt for this channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// Per-team configuration override for a Mattermost team.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MmTeamConfig {
+    /// Team slug (internal name) or display name; matched case-sensitively.
+    pub name: String,
+    /// Set to `false` to skip all channels in this team.
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    /// Extra context appended to every channel summary prompt in this team.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+fn bool_true() -> bool {
+    true
 }
 
 /// IMAP email data source configuration.
@@ -49,9 +90,67 @@ pub struct EmailConfig {
     pub port: u16,
     pub username: String,
     pub password: String,
-    /// Mailboxes to poll for unread messages (e.g. ["INBOX", "INBOX.Work"]).
+    /// Mailboxes to poll. Each entry is either a bare mailbox name string
+    /// (`"INBOX"`) or a table with `name`, optional `enabled` (default true),
+    /// and optional `instructions` for extra LLM context.
     #[serde(default)]
-    pub mailboxes: Vec<String>,
+    pub mailboxes: Vec<MailboxConfig>,
+}
+
+/// Per-mailbox configuration. Supports both simple string form and full table.
+///
+/// Simple TOML:   `mailboxes = ["INBOX", "INBOX.Work"]`
+/// Full TOML:
+/// ```toml
+/// [[email.mailboxes]]
+/// name = "INBOX"
+/// instructions = "Focus on customer support escalations."
+///
+/// [[email.mailboxes]]
+/// name = "INBOX.Work"
+/// enabled = false
+/// ```
+#[derive(Debug, Clone, Serialize)]
+pub struct MailboxConfig {
+    pub name: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for MailboxConfig {
+    fn deserialize<D>(de: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Helper {
+            Simple(String),
+            Full {
+                name: String,
+                enabled: Option<bool>,
+                #[serde(default)]
+                instructions: Option<String>,
+            },
+        }
+        Ok(match Helper::deserialize(de)? {
+            Helper::Simple(name) => Self {
+                name,
+                enabled: true,
+                instructions: None,
+            },
+            Helper::Full {
+                name,
+                enabled,
+                instructions,
+            } => Self {
+                name,
+                enabled: enabled.unwrap_or(true),
+                instructions,
+            },
+        })
+    }
 }
 
 fn default_imap_port() -> u16 {
@@ -182,6 +281,8 @@ impl Default for MattermostConfig {
         Self {
             server_url: default_mm_server_url(),
             token: default_mm_token(),
+            channels: Vec::new(),
+            teams: Vec::new(),
         }
     }
 }

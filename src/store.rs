@@ -139,6 +139,15 @@ impl Store {
                 mailbox      TEXT NOT NULL PRIMARY KEY,
                 summary_json TEXT NOT NULL,
                 updated_at   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS source_config (
+                source_type  TEXT NOT NULL,
+                name         TEXT NOT NULL,
+                team         TEXT NOT NULL DEFAULT '',
+                enabled      INTEGER NOT NULL DEFAULT 1,
+                instructions TEXT,
+                updated_at   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (source_type, name, team)
             );",
         )
         .context("failed to initialise database schema")?;
@@ -698,6 +707,64 @@ impl Store {
     }
 }
 
+// --- Source config ---
+
+/// A single row from the `source_config` table.
+#[derive(Debug, Clone)]
+pub struct SourceConfigRow {
+    pub source_type: String,
+    pub name: String,
+    pub team: String,
+    pub enabled: bool,
+    pub instructions: Option<String>,
+}
+
+impl Store {
+    /// Return all source_config rows for `source_type` (e.g. "mm_channel").
+    pub fn get_source_configs(&self, source_type: &str) -> Result<Vec<SourceConfigRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT source_type, name, team, enabled, instructions
+             FROM source_config WHERE source_type = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![source_type], |row| {
+                Ok(SourceConfigRow {
+                    source_type: row.get(0)?,
+                    name: row.get(1)?,
+                    team: row.get(2)?,
+                    enabled: row.get::<_, i64>(3)? != 0,
+                    instructions: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to query source_config")?;
+        Ok(rows)
+    }
+
+    /// Insert or update a source_config entry.
+    pub fn upsert_source_config(
+        &self,
+        source_type: &str,
+        name: &str,
+        team: &str,
+        enabled: bool,
+        instructions: Option<&str>,
+    ) -> Result<()> {
+        let now = jiff::Timestamp::now().as_millisecond();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO source_config (source_type, name, team, enabled, instructions, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(source_type, name, team)
+             DO UPDATE SET enabled = ?4, instructions = ?5, updated_at = ?6",
+            params![source_type, name, team, enabled as i64, instructions, now],
+        )
+        .context("failed to upsert source_config")?;
+        Ok(())
+    }
+}
+
 fn action_item_id(channel_id: &str, text: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -960,5 +1027,59 @@ mod tests {
         let cached = s.get_cached_email_summaries().unwrap();
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].0, "INBOX.Work");
+    }
+
+    #[test]
+    fn source_config_upsert_and_get() {
+        let s = test_store();
+        assert!(s.get_source_configs("mm_channel").unwrap().is_empty());
+
+        s.upsert_source_config("mm_channel", "general", "TeamA", true, None)
+            .unwrap();
+        let rows = s.get_source_configs("mm_channel").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "general");
+        assert_eq!(rows[0].team, "TeamA");
+        assert!(rows[0].enabled);
+        assert!(rows[0].instructions.is_none());
+    }
+
+    #[test]
+    fn source_config_enabled_toggle() {
+        let s = test_store();
+        s.upsert_source_config("mm_channel", "general", "TeamA", true, None)
+            .unwrap();
+        s.upsert_source_config("mm_channel", "general", "TeamA", false, None)
+            .unwrap();
+        let rows = s.get_source_configs("mm_channel").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].enabled);
+    }
+
+    #[test]
+    fn source_config_instructions() {
+        let s = test_store();
+        s.upsert_source_config(
+            "mm_channel",
+            "support",
+            "TeamA",
+            true,
+            Some("Focus on escalations."),
+        )
+        .unwrap();
+        let rows = s.get_source_configs("mm_channel").unwrap();
+        assert_eq!(rows[0].instructions.as_deref(), Some("Focus on escalations."));
+    }
+
+    #[test]
+    fn source_config_filtered_by_source_type() {
+        let s = test_store();
+        s.upsert_source_config("mm_channel", "general", "TeamA", true, None)
+            .unwrap();
+        s.upsert_source_config("email_mailbox", "INBOX", "", true, None)
+            .unwrap();
+        assert_eq!(s.get_source_configs("mm_channel").unwrap().len(), 1);
+        assert_eq!(s.get_source_configs("email_mailbox").unwrap().len(), 1);
+        assert!(s.get_source_configs("other").unwrap().is_empty());
     }
 }
