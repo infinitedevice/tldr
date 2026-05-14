@@ -21,6 +21,7 @@
     resolved: boolean;
     ignored: boolean;
     claimed: boolean;
+    source?: string;
   }
 
   interface TopicSection {
@@ -43,7 +44,18 @@
     participants?: string[];
   }
 
+  interface EmailSummary {
+    mailbox: string;
+    mailbox_id: string;
+    unread_count: number;
+    summary: string;
+    summary_html: string;
+    topics?: TopicSection[];
+    action_items: ActionItem[];
+  }
+
   let summaries: Summary[] = $state([]);
+  let emailSummaries: EmailSummary[] = $state([]);
   let allItems: ActionItem[] = $state([]);
   let loading = $state(true);
 
@@ -54,17 +66,37 @@
     ),
   );
 
+  // Email summaries with pending action items
+  const emailWithActions = $derived(
+    emailSummaries.filter((s) =>
+      s.action_items.some((i) => !i.resolved && !i.ignored),
+    ),
+  );
+
+  // Build a combined name lookup: channel_id / mailbox → display name
+  const nameMap = $derived(() => {
+    const m = new Map<string, { name: string; source: string; url?: string }>();
+    for (const s of summaries) {
+      m.set(s.channel_id, { name: s.channel_name, source: "mattermost", url: s.channel_url });
+    }
+    for (const s of emailSummaries) {
+      m.set(s.mailbox, { name: s.mailbox, source: "email" });
+    }
+    return m;
+  });
+
   // Claimed items from the global action items list, grouped by channel
   const claimedByChannel = $derived(() => {
     const claimed = allItems.filter(
       (i) => i.claimed && !i.resolved && !i.ignored,
     );
-    const map = new Map<string, { channel_id: string; channel_name: string; items: ActionItem[] }>();
+    const map = new Map<string, { channel_id: string; channel_name: string; source: string; url?: string; items: ActionItem[] }>();
     for (const item of claimed) {
-      const s = summaries.find((s) => s.channel_id === item.channel_id);
-      const name = s?.channel_name ?? item.channel_id;
+      const info = nameMap().get(item.channel_id);
+      const name = info?.name ?? item.channel_id;
+      const src = item.source ?? info?.source ?? "mattermost";
       if (!map.has(item.channel_id)) {
-        map.set(item.channel_id, { channel_id: item.channel_id, channel_name: name, items: [] });
+        map.set(item.channel_id, { channel_id: item.channel_id, channel_name: name, source: src, url: info?.url, items: [] });
       }
       map.get(item.channel_id)!.items.push(item);
     }
@@ -83,7 +115,6 @@
         .then((r) => (r.ok ? r.json() : null))
         .then((d: { summaries?: Summary[] } | null) => {
           if (d?.summaries) {
-            // Merge action_items in-place to avoid re-ordering channels
             const freshMap = new Map(
               d.summaries.map((s: Summary) => [s.channel_id, s.action_items]),
             );
@@ -93,10 +124,28 @@
                 ? { ...s, action_items: freshItems }
                 : s;
             });
-            // Add any newly appeared channels (shouldn't happen often in Actions view)
             const existing = new Set(summaries.map((s) => s.channel_id));
             for (const s of d.summaries) {
               if (!existing.has(s.channel_id)) summaries = [...summaries, s];
+            }
+          }
+        }),
+      fetch("/api/v1/email/summaries")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d: { summaries?: EmailSummary[] } | null) => {
+          if (d?.summaries) {
+            const freshMap = new Map(
+              d.summaries.map((s: EmailSummary) => [s.mailbox, s.action_items]),
+            );
+            emailSummaries = emailSummaries.map((s) => {
+              const freshItems = freshMap.get(s.mailbox);
+              return freshItems !== undefined
+                ? { ...s, action_items: freshItems }
+                : s;
+            });
+            const existing = new Set(emailSummaries.map((s) => s.mailbox));
+            for (const s of d.summaries) {
+              if (!existing.has(s.mailbox)) emailSummaries = [...emailSummaries, s];
             }
           }
         }),
@@ -159,8 +208,20 @@
         <div class="space-y-3">
           {#each claimedByChannel() as group}
             <div class="bg-blue-950/30 border border-blue-800/40 rounded-lg p-4">
-              <h3 class="text-xs font-semibold text-blue-300 mb-2">
-                #{group.channel_name}
+              <h3 class="text-xs font-semibold text-blue-300 mb-2 flex items-center gap-1.5">
+                {#if group.source === "email"}
+                  <svg viewBox="0 0 24 24" class="w-3.5 h-3.5 shrink-0 fill-none stroke-current" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="2" y="4" width="20" height="16" rx="2" />
+                    <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
+                  </svg>
+                  {group.channel_name}
+                {:else if group.url}
+                  <a href={group.url} target="_blank" rel="noopener noreferrer" class="hover:underline">
+                    #{group.channel_name}
+                  </a>
+                {:else}
+                  #{group.channel_name}
+                {/if}
               </h3>
               <ul class="space-y-2">
                 {#each group.items as item (item.id)}
@@ -207,7 +268,7 @@
         Pending action items
       </h2>
 
-      {#if summariesWithActions.length === 0}
+      {#if summariesWithActions.length === 0 && emailWithActions.length === 0}
         <p class="text-sm text-gray-500 italic">No pending action items across any channel.</p>
       {:else}
         <div class="space-y-4">
@@ -240,6 +301,32 @@
 
               <ActionItemsList
                 channelId={s.channel_id}
+                items={s.action_items}
+                onupdate={refreshData}
+              />
+            </article>
+          {/each}
+
+          {#each emailWithActions as s}
+            <article
+              class="bg-gray-800 rounded-lg border border-gray-700 p-4"
+              aria-labelledby="actions-mailbox-{s.mailbox_id}"
+            >
+              <div class="flex items-center gap-2 mb-2">
+                <svg viewBox="0 0 24 24" class="w-4 h-4 text-cyan-400 fill-none stroke-current" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="2" y="4" width="20" height="16" rx="2" />
+                  <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
+                </svg>
+                <span
+                  class="text-cyan-400 font-bold text-sm"
+                  id="actions-mailbox-{s.mailbox_id}"
+                >
+                  {s.mailbox}
+                </span>
+              </div>
+
+              <ActionItemsList
+                channelId={s.mailbox}
                 items={s.action_items}
                 onupdate={refreshData}
               />

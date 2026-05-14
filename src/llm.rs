@@ -301,6 +301,113 @@ impl LlmClient {
         Ok((result, raw))
     }
 
+    /// Summarise a batch of emails from a mailbox.
+    ///
+    /// `emails` is a list of `(from, subject, date, body)` tuples.  Returns the
+    /// same [`LlmSummary`] format as [`Self::summarise`], with topics and action items.
+    pub async fn summarise_emails(
+        &self,
+        mailbox_name: &str,
+        emails: &[(String, String, String, String)], // (from, subject, date, body)
+        prior_action_items: &[String],
+    ) -> Result<(LlmSummary, String)> {
+        if emails.is_empty() {
+            return Ok((LlmSummary::default(), String::new()));
+        }
+
+        let email_text = emails
+            .iter()
+            .map(|(from, subject, date, body)| {
+                let trimmed_body = body.chars().take(1500).collect::<String>();
+                format!(
+                    "---\nFrom: {from}\nSubject: {subject}\nDate: {date}\n\n{trimmed_body}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let mut user_prompt = format!(
+            "Summarise the following unread emails from mailbox \"{mailbox_name}\":\n\n{email_text}"
+        );
+
+        if !prior_action_items.is_empty() {
+            user_prompt.push_str(
+                "\n\n[OPEN ACTION ITEMS from previous summaries — assess if resolved]:\n",
+            );
+            for item in prior_action_items {
+                user_prompt.push_str(&format!("- {item}\n"));
+            }
+        }
+
+        let system_prompt =
+            "You are a concise email summariser. \
+            Summarise the provided emails, grouping related threads by topic. \
+            IMPORTANT: Always include the sender's email address and the subject line when \
+            referring to specific emails. Never write \"a sender\" or \"someone\" — always \
+            use the actual name and address from the From header. \
+            Respond with ONLY a JSON object — no markdown fences, no preamble. \
+            Format: {\"topics\": [{\"title\": \"Short topic title\", \"summary\": \"- bullet\\n- bullet\"}], \
+            \"action_items\": [\"item 1\", \"item 2\"]}. \
+            Group emails into 1–5 named topic sections. Each topic's summary field uses \
+            markdown bullet points (start each point with \"- \"). \
+            The action_items array contains only new or still-pending action items from the emails, \
+            as short imperative sentences."
+            .to_string();
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt },
+            ],
+            "temperature": 0.3,
+        });
+
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("failed to send email LLM request")?;
+
+        let completion: ChatCompletionResponse = resp
+            .error_for_status()
+            .context("email LLM chat completion request failed")?
+            .json()
+            .await
+            .context("failed to parse email LLM response")?;
+
+        let raw = completion
+            .choices
+            .first()
+            .map(|c| c.message.content.trim().to_string())
+            .unwrap_or_default();
+
+        let stripped = {
+            let s = raw.trim();
+            let s = s
+                .strip_prefix("```json")
+                .or_else(|| s.strip_prefix("```"))
+                .unwrap_or(s)
+                .trim();
+            s.strip_suffix("```").unwrap_or(s).trim()
+        };
+
+        let result = serde_json::from_str::<LlmSummary>(stripped).unwrap_or_else(|_| LlmSummary {
+            topics: vec![TopicPoint {
+                title: "Summary".into(),
+                summary: raw.clone(),
+            }],
+            summary: raw.clone(),
+            action_items: Vec::new(),
+            topic: None,
+        });
+
+        Ok((result, raw))
+    }
+
     /// Cross-channel synthesis: asks the LLM to produce a structured narrative from a set of
     /// per-channel insight snapshots. Returns an [`InsightsSummary`] with themes, risks, etc.
     pub async fn synthesize_insights(

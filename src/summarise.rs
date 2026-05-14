@@ -345,7 +345,7 @@ async fn summarise_channel(
     // Persist new action items and advance the watermark
     let action_items: Vec<ActionItemSummary> = if let Some(s) = &store {
         let now = jiff::Timestamp::now().as_millisecond();
-        if let Err(e) = s.upsert_action_items(&channel.id, &llm_result.action_items, now) {
+        if let Err(e) = s.upsert_action_items(&channel.id, &llm_result.action_items, now, "mattermost") {
             warn!("failed to upsert action items for {}: {e:#}", channel.id);
         }
         if let Some(latest) = unread_posts.iter().map(|p| p.create_at).max()
@@ -705,7 +705,7 @@ pub async fn summarise_all_unread_stream(
     Ok(())
 }
 
-fn markdown_to_html(md: &str) -> String {
+pub fn markdown_to_html(md: &str) -> String {
     use pulldown_cmark::{Options, Parser, html};
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);

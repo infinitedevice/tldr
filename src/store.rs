@@ -27,6 +27,13 @@ pub struct ActionItem {
     pub resolved: bool,
     pub ignored: bool,
     pub claimed: bool,
+    /// Origin of this item: "mattermost" or "email".
+    #[serde(default = "default_source")]
+    pub source: String,
+}
+
+fn default_source() -> String {
+    "mattermost".to_string()
 }
 
 /// A per-channel insight snapshot stored after each summarise run.
@@ -122,6 +129,16 @@ impl Store {
                 channel_id   TEXT PRIMARY KEY,
                 summary_json TEXT NOT NULL,
                 updated_at   INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS email_watermark (
+                mailbox    TEXT NOT NULL PRIMARY KEY,
+                last_uid   INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS cached_email_summary (
+                mailbox      TEXT NOT NULL PRIMARY KEY,
+                summary_json TEXT NOT NULL,
+                updated_at   INTEGER NOT NULL DEFAULT 0
             );",
         )
         .context("failed to initialise database schema")?;
@@ -142,6 +159,10 @@ impl Store {
         );
         let _ = conn.execute(
             "ALTER TABLE action_item ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE action_item ADD COLUMN source TEXT NOT NULL DEFAULT 'mattermost'",
             [],
         );
 
@@ -210,21 +231,23 @@ impl Store {
 
     // --- Action items ---
 
-    /// Insert or update action items for a channel. ID is a content hash for deduplication.
+    /// Insert or update action items for a channel.
+    /// `source` should be "mattermost" or "email".
     pub fn upsert_action_items(
         &self,
         channel_id: &str,
         texts: &[String],
         created_at: i64,
+        source: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         for text in texts {
             let id = action_item_id(channel_id, text);
             conn.execute(
-                "INSERT INTO action_item (id, channel_id, text, created_at)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO action_item (id, channel_id, text, created_at, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(id) DO NOTHING",
-                params![id, channel_id, text, created_at],
+                params![id, channel_id, text, created_at, source],
             )
             .context("failed to upsert action item")?;
         }
@@ -235,7 +258,7 @@ impl Store {
     pub fn get_pending_action_items(&self, channel_id: &str) -> Result<Vec<ActionItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed
+            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source
              FROM action_item
              WHERE channel_id = ?1 AND resolved = 0 AND ignored = 0
              ORDER BY created_at",
@@ -250,6 +273,7 @@ impl Store {
                     resolved: row.get::<_, i64>(4)? != 0,
                     ignored: row.get::<_, i64>(5)? != 0,
                     claimed: row.get::<_, i64>(6)? != 0,
+                    source: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "mattermost".to_string()),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -261,7 +285,7 @@ impl Store {
     pub fn get_all_action_items(&self, channel_id: &str) -> Result<Vec<ActionItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed
+            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source
              FROM action_item WHERE channel_id = ?1 ORDER BY created_at",
         )?;
         let items = stmt
@@ -274,6 +298,7 @@ impl Store {
                     resolved: row.get::<_, i64>(4)? != 0,
                     ignored: row.get::<_, i64>(5)? != 0,
                     claimed: row.get::<_, i64>(6)? != 0,
+                    source: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "mattermost".to_string()),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -285,7 +310,7 @@ impl Store {
     pub fn get_all_action_items_global(&self) -> Result<Vec<ActionItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed
+            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source
              FROM action_item ORDER BY created_at",
         )?;
         let items = stmt
@@ -298,6 +323,7 @@ impl Store {
                     resolved: row.get::<_, i64>(4)? != 0,
                     ignored: row.get::<_, i64>(5)? != 0,
                     claimed: row.get::<_, i64>(6)? != 0,
+                    source: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "mattermost".to_string()),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -603,6 +629,73 @@ impl Store {
             .context("failed to clear cached summaries")?;
         Ok(())
     }
+
+    // --- Email watermarks ---
+
+    /// Get the last-seen IMAP UID for a mailbox (0 = never fetched).
+    pub fn get_email_watermark(&self, mailbox: &str) -> u32 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT last_uid FROM email_watermark WHERE mailbox = ?1",
+            params![mailbox],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+        .map(|v| v as u32)
+        .unwrap_or(0)
+    }
+
+    pub fn set_email_watermark(&self, mailbox: &str, last_uid: u32) -> Result<()> {
+        let now = jiff::Timestamp::now().as_millisecond();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO email_watermark (mailbox, last_uid, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(mailbox) DO UPDATE SET last_uid = ?2, updated_at = ?3",
+            params![mailbox, last_uid as i64, now],
+        )
+        .context("failed to set email watermark")?;
+        Ok(())
+    }
+
+    // --- Cached email summaries ---
+
+    pub fn set_cached_email_summary(&self, mailbox: &str, json: &str) -> Result<()> {
+        let now = jiff::Timestamp::now().as_millisecond();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO cached_email_summary (mailbox, summary_json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(mailbox) DO UPDATE SET summary_json = ?2, updated_at = ?3",
+            params![mailbox, json, now],
+        )
+        .context("failed to set cached email summary")?;
+        Ok(())
+    }
+
+    pub fn get_cached_email_summaries(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT mailbox, summary_json FROM cached_email_summary ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to query cached email summaries")?;
+        Ok(rows)
+    }
+
+    pub fn remove_cached_email_summary(&self, mailbox: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM cached_email_summary WHERE mailbox = ?1",
+            params![mailbox],
+        )
+        .context("failed to remove cached email summary")?;
+        Ok(())
+    }
 }
 
 fn action_item_id(channel_id: &str, text: &str) -> String {
@@ -656,7 +749,7 @@ mod tests {
     fn action_items_upsert_and_pending() {
         let s = test_store();
         let items = vec!["Fix bug".to_string(), "Deploy v2".to_string()];
-        s.upsert_action_items("ch1", &items, 1000).unwrap();
+        s.upsert_action_items("ch1", &items, 1000, "mattermost").unwrap();
 
         let pending = s.get_pending_action_items("ch1").unwrap();
         assert_eq!(pending.len(), 2);
@@ -668,8 +761,8 @@ mod tests {
     fn action_items_dedup() {
         let s = test_store();
         let items = vec!["Fix bug".to_string()];
-        s.upsert_action_items("ch1", &items, 1000).unwrap();
-        s.upsert_action_items("ch1", &items, 2000).unwrap();
+        s.upsert_action_items("ch1", &items, 1000, "mattermost").unwrap();
+        s.upsert_action_items("ch1", &items, 2000, "mattermost").unwrap();
 
         let all = s.get_all_action_items("ch1").unwrap();
         assert_eq!(all.len(), 1);
@@ -679,7 +772,7 @@ mod tests {
     fn action_item_resolve_and_ignore() {
         let s = test_store();
         let items = vec!["Task A".to_string()];
-        s.upsert_action_items("ch1", &items, 1000).unwrap();
+        s.upsert_action_items("ch1", &items, 1000, "mattermost").unwrap();
 
         let pending = s.get_pending_action_items("ch1").unwrap();
         let id = &pending[0].id;
@@ -771,7 +864,7 @@ mod tests {
     #[test]
     fn action_item_claim_and_unclaim() {
         let s = test_store();
-        s.upsert_action_items("ch1", &["Task A".to_string()], 1000)
+        s.upsert_action_items("ch1", &items(&["Task A"]), 1000, "mattermost")
             .unwrap();
 
         let pending = s.get_pending_action_items("ch1").unwrap();
@@ -794,7 +887,7 @@ mod tests {
     #[test]
     fn action_item_claimed_visible_in_global_list() {
         let s = test_store();
-        s.upsert_action_items("ch1", &["Task A".to_string()], 1000)
+        s.upsert_action_items("ch1", &items(&["Task A"]), 1000, "mattermost")
             .unwrap();
         let id = s.get_pending_action_items("ch1").unwrap()[0].id.clone();
 
@@ -803,5 +896,69 @@ mod tests {
         let global = s.get_all_action_items_global().unwrap();
         assert_eq!(global.len(), 1);
         assert!(global[0].claimed);
+    }
+
+    #[test]
+    fn email_watermark_defaults_to_zero() {
+        let s = test_store();
+        assert_eq!(s.get_email_watermark("INBOX"), 0);
+    }
+
+    #[test]
+    fn email_watermark_round_trip() {
+        let s = test_store();
+        s.set_email_watermark("INBOX", 42).unwrap();
+        assert_eq!(s.get_email_watermark("INBOX"), 42);
+    }
+
+    #[test]
+    fn email_watermark_update() {
+        let s = test_store();
+        s.set_email_watermark("INBOX", 10).unwrap();
+        s.set_email_watermark("INBOX", 99).unwrap();
+        assert_eq!(s.get_email_watermark("INBOX"), 99);
+    }
+
+    #[test]
+    fn email_watermark_per_mailbox() {
+        let s = test_store();
+        s.set_email_watermark("INBOX", 1).unwrap();
+        s.set_email_watermark("INBOX.Work", 2).unwrap();
+        assert_eq!(s.get_email_watermark("INBOX"), 1);
+        assert_eq!(s.get_email_watermark("INBOX.Work"), 2);
+    }
+
+    #[test]
+    fn cached_email_summary_crud() {
+        let s = test_store();
+        assert!(s.get_cached_email_summaries().unwrap().is_empty());
+
+        s.set_cached_email_summary("INBOX", r#"{"summary":"hello"}"#)
+            .unwrap();
+        let cached = s.get_cached_email_summaries().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].0, "INBOX");
+        assert_eq!(cached[0].1, r#"{"summary":"hello"}"#);
+
+        s.set_cached_email_summary("INBOX", r#"{"summary":"updated"}"#)
+            .unwrap();
+        let cached = s.get_cached_email_summaries().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].1, r#"{"summary":"updated"}"#);
+
+        s.remove_cached_email_summary("INBOX").unwrap();
+        assert!(s.get_cached_email_summaries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cached_email_summary_multiple_mailboxes() {
+        let s = test_store();
+        s.set_cached_email_summary("INBOX", "{}").unwrap();
+        s.set_cached_email_summary("INBOX.Work", "{}").unwrap();
+        assert_eq!(s.get_cached_email_summaries().unwrap().len(), 2);
+        s.remove_cached_email_summary("INBOX").unwrap();
+        let cached = s.get_cached_email_summaries().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].0, "INBOX.Work");
     }
 }

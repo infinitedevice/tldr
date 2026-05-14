@@ -45,10 +45,14 @@ pub struct AppState {
     pub summarise_active: Arc<AtomicUsize>,
     /// In-memory seeding progress, updated by the background seeding task.
     pub seeding_progress: Arc<RwLock<SeedingProgress>>,
-    /// In-memory cache of latest channel summaries (populated by background loop + on-demand).
+    /// In-memory cache of latest Mattermost channel summaries.
     pub summary_cache: Arc<RwLock<Vec<crate::output::ChannelSummary>>>,
-    /// Broadcast channel for real-time SSE updates when a summary changes.
+    /// Broadcast channel for real-time SSE updates when a Mattermost summary changes.
     pub summary_tx: broadcast::Sender<crate::output::ChannelSummary>,
+    /// In-memory cache of latest email mailbox summaries.
+    pub email_cache: Arc<RwLock<Vec<crate::output::EmailSummary>>>,
+    /// Broadcast channel for real-time SSE updates when an email summary changes.
+    pub email_tx: broadcast::Sender<crate::output::EmailSummary>,
 }
 
 /// Live progress of the first-run history seeding task.

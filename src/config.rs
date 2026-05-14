@@ -22,6 +22,9 @@ pub struct Config {
     pub paths: PathsConfig,
     #[serde(default)]
     pub server: ServerConfig,
+    /// Optional email (IMAP) data source. Absent means email is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<EmailConfig>,
     /// Mattermost @usernames whose messages should be highlighted in summaries.
     #[serde(default)]
     pub priority_users: Vec<String>,
@@ -36,6 +39,23 @@ pub struct MattermostConfig {
     pub server_url: String,
     #[serde(default = "default_mm_token")]
     pub token: String,
+}
+
+/// IMAP email data source configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmailConfig {
+    pub server: String,
+    #[serde(default = "default_imap_port")]
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    /// Mailboxes to poll for unread messages (e.g. ["INBOX", "INBOX.Work"]).
+    #[serde(default)]
+    pub mailboxes: Vec<String>,
+}
+
+fn default_imap_port() -> u16 {
+    993
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -346,5 +366,74 @@ token = "x"
             assert!(p.to_string_lossy().starts_with(&home));
             assert!(p.to_string_lossy().ends_with("foo/bar"));
         }
+    }
+
+    #[test]
+    fn email_config_simple_mailboxes() {
+        let toml = r#"
+[mattermost]
+server_url = "https://chat.example.com"
+token = "tok"
+
+[email]
+server = "imap.example.com"
+username = "user@example.com"
+password = "s3cr3t"
+mailboxes = ["INBOX", "INBOX.Work"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let email = config.email.expect("email section should be present");
+        assert_eq!(email.server, "imap.example.com");
+        assert_eq!(email.port, 993);
+        assert_eq!(email.mailboxes.len(), 2);
+        assert_eq!(email.mailboxes[0].name, "INBOX");
+        assert!(email.mailboxes[0].enabled);
+        assert!(email.mailboxes[0].instructions.is_none());
+    }
+
+    #[test]
+    fn email_config_full_mailbox_table() {
+        let toml = r#"
+[mattermost]
+server_url = "https://chat.example.com"
+token = "tok"
+
+[email]
+server = "imap.example.com"
+username = "user@example.com"
+password = "s3cr3t"
+
+[[email.mailboxes]]
+name = "INBOX"
+instructions = "Focus on escalations."
+
+[[email.mailboxes]]
+name = "INBOX.Archive"
+enabled = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let email = config.email.unwrap();
+        assert_eq!(email.mailboxes.len(), 2);
+        assert_eq!(
+            email.mailboxes[0].instructions.as_deref(),
+            Some("Focus on escalations.")
+        );
+        assert!(email.mailboxes[0].enabled);
+        assert!(!email.mailboxes[1].enabled);
+    }
+
+    #[test]
+    fn email_config_absent_is_none() {
+        let toml = r#"
+[mattermost]
+server_url = "https://chat.example.com"
+token = "tok"
+
+[llm]
+base_url = "https://llm.example.com"
+model = "gpt-4o"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.email.is_none());
     }
 }

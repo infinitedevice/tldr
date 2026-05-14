@@ -15,6 +15,7 @@ path = "src/bin/tldr-cli.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -43,6 +44,10 @@ futures = "0.3"
 # ort rc.9 (used by fastembed 4.x) bundles ONNX Runtime 1.18 via ort-sys rc.9.
 # Pin exactly to prevent Cargo from pulling an incompatible ort-sys version.
 ort-sys = "=2.0.0-rc.9"
+# IMAP client dependencies (email data source)
+async-imap = "0.11"
+async-native-tls = "0.6"
+mail-parser = "0.11"
 
 [dev-dependencies]
 serde_yaml = "0.9"

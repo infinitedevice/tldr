@@ -20,9 +20,10 @@
   import SummarisePage from "./pages/SummarisePage.svelte";
   import InsightsPage from "./pages/InsightsPage.svelte";
   import ActionsPage from "./pages/ActionsPage.svelte";
+  import EmailPage from "./pages/EmailPage.svelte";
   import { startTour, startTourIfNew } from "./lib/ProductTour";
 
-  type Page = "summarise" | "insights" | "actions";
+  type Page = "summarise" | "insights" | "actions" | "email";
 
   let currentPage: Page = $state("summarise");
   let showWizard = $state(false);
@@ -244,6 +245,32 @@
           <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
         </svg>
       </Navigation.Tile>
+
+      <!-- Email -->
+      <Navigation.Tile
+        id="email"
+        label="Email"
+        title="Email summaries"
+        width="w-full"
+        padding="px-1 py-2"
+        gap="gap-1"
+        rounded="rounded-lg"
+        hover="hover:bg-gray-700/60"
+        active="bg-gray-700/80"
+        labelBase="text-[10px] leading-tight text-center"
+      >
+        <!-- Envelope icon -->
+        <svg
+          viewBox="0 0 24 24"
+          class="w-5 h-5 fill-none stroke-current mx-auto"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <rect x="2" y="4" width="20" height="16" rx="2" />
+          <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
+        </svg>
+      </Navigation.Tile>
     {/snippet}
 
     {#snippet footer()}
@@ -315,7 +342,7 @@
       <span
         class="text-xs font-semibold uppercase tracking-widest text-gray-400"
       >
-        {currentPage === "summarise" ? "Summarise" : currentPage === "insights" ? "Insights" : "Actions"}
+        {currentPage === "summarise" ? "Summarise" : currentPage === "insights" ? "Insights" : currentPage === "actions" ? "Actions" : "Email"}
       </span>
 
       {#snippet trail()}
@@ -464,6 +491,9 @@
       </div>
       <div class:hidden={currentPage !== "actions"}>
         <ActionsPage />
+      </div>
+      <div class:hidden={currentPage !== "email"}>
+        <EmailPage />
       </div>
     </main>
   </div>

@@ -55,6 +55,38 @@ pub struct ChannelSummary {
     pub participants: Vec<String>,
 }
 
+/// Brief metadata for a single email shown in the summary list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailMeta {
+    pub subject: String,
+    pub from: String,
+    pub date: String,
+}
+
+/// Summary for one email mailbox, analogous to [`ChannelSummary`] for Mattermost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailSummary {
+    /// Human-readable mailbox name (e.g. "INBOX" or "INBOX/People Leads").
+    pub mailbox: String,
+    /// URL-safe version of mailbox for use in API paths.
+    pub mailbox_id: String,
+    pub unread_count: usize,
+    pub summary: String,
+    pub summary_html: String,
+    /// Named topic sections — primary display. Falls back to summary_html when empty.
+    #[serde(default)]
+    pub topics: Vec<TopicSection>,
+    #[serde(default)]
+    pub action_items: Vec<ActionItemSummary>,
+    /// Brief list of emails included in this summary (subject, from, date).
+    #[serde(default)]
+    pub emails: Vec<EmailMeta>,
+    /// Highest UID seen in this batch — used by the mark-as-read handler to
+    /// advance the watermark.  Not displayed in the UI.
+    #[serde(default)]
+    pub max_uid: u32,
+}
+
 pub fn print_summaries(summaries: &[ChannelSummary]) {
     if summaries.is_empty() {
         println!("{}", "No unread channels to summarise.".dimmed());
