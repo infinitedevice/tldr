@@ -24,9 +24,9 @@
   import SourcesPage from "./pages/SourcesPage.svelte";
   import { startTour, startTourIfNew } from "./lib/ProductTour";
 
-  type Page = "summarise" | "insights" | "actions" | "email" | "sources";
+  type Page = "chat" | "insights" | "actions" | "email" | "sources";
 
-  let currentPage: Page = $state("summarise");
+  let currentPage: Page = $state("insights");
   let showWizard = $state(false);
   let configAllowCancel = $state(false);
   let showUserMenu = $state(false);
@@ -164,36 +164,6 @@
     tilesClasses="flex-1 pt-2"
   >
     {#snippet tiles()}
-      <!-- Summarise -->
-      <Navigation.Tile
-        id="summarise"
-        label="Summarise"
-        title="Summarise unread channels"
-        width="w-full"
-        padding="px-1 py-2"
-        gap="gap-1"
-        rounded="rounded-lg"
-        hover="hover:bg-gray-700/60"
-        active="bg-gray-700/80"
-        labelBase="text-[10px] leading-tight text-center"
-      >
-        <!-- List icon -->
-        <svg
-          viewBox="0 0 24 24"
-          class="w-5 h-5 fill-none stroke-current mx-auto"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        >
-          <line x1="8" y1="6" x2="21" y2="6" />
-          <line x1="8" y1="12" x2="21" y2="12" />
-          <line x1="8" y1="18" x2="13" y2="18" />
-          <circle cx="3" cy="6" r="1" fill="currentColor" />
-          <circle cx="3" cy="12" r="1" fill="currentColor" />
-          <circle cx="3" cy="18" r="1" fill="currentColor" />
-        </svg>
-      </Navigation.Tile>
-
       <!-- Insights -->
       <Navigation.Tile
         id="insights"
@@ -221,11 +191,11 @@
         </svg>
       </Navigation.Tile>
 
-      <!-- Actions -->
+      <!-- Chat -->
       <Navigation.Tile
-        id="actions"
-        label="Actions"
-        title="Action items across channels"
+        id="chat"
+        label="Chat"
+        title="Mattermost channel summaries"
         width="w-full"
         padding="px-1 py-2"
         gap="gap-1"
@@ -234,7 +204,7 @@
         active="bg-gray-700/80"
         labelBase="text-[10px] leading-tight text-center"
       >
-        <!-- Clipboard-check icon -->
+        <!-- Chat bubble icon -->
         <svg
           viewBox="0 0 24 24"
           class="w-5 h-5 fill-none stroke-current mx-auto"
@@ -242,8 +212,7 @@
           stroke-linecap="round"
           stroke-linejoin="round"
         >
-          <polyline points="9 11 12 14 22 4" />
-          <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
         </svg>
       </Navigation.Tile>
 
@@ -270,6 +239,32 @@
         >
           <rect x="2" y="4" width="20" height="16" rx="2" />
           <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
+        </svg>
+      </Navigation.Tile>
+
+      <!-- Actions -->
+      <Navigation.Tile
+        id="actions"
+        label="Actions"
+        title="Action items across channels"
+        width="w-full"
+        padding="px-1 py-2"
+        gap="gap-1"
+        rounded="rounded-lg"
+        hover="hover:bg-gray-700/60"
+        active="bg-gray-700/80"
+        labelBase="text-[10px] leading-tight text-center"
+      >
+        <!-- Clipboard-check icon -->
+        <svg
+          viewBox="0 0 24 24"
+          class="w-5 h-5 fill-none stroke-current mx-auto"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <polyline points="9 11 12 14 22 4" />
+          <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
         </svg>
       </Navigation.Tile>
     {/snippet}
@@ -360,7 +355,7 @@
       <span
         class="text-xs font-semibold uppercase tracking-widest text-gray-400"
       >
-        {currentPage === "summarise" ? "Summarise" : currentPage === "insights" ? "Insights" : currentPage === "actions" ? "Actions" : currentPage === "email" ? "Email" : "Sources"}
+        {currentPage === "chat" ? "Chat" : currentPage === "insights" ? "Insights" : currentPage === "actions" ? "Actions" : currentPage === "email" ? "Email" : "Sources"}
       </span>
 
       {#snippet trail()}
@@ -501,7 +496,7 @@
 
     <!-- Page content — all pages are always mounted to preserve state -->
     <main class="flex-1 overflow-y-auto bg-gray-950">
-      <div class:hidden={currentPage !== "summarise"}>
+      <div class:hidden={currentPage !== "chat"}>
         <SummarisePage />
       </div>
       <div class:hidden={currentPage !== "insights"}>
