@@ -547,6 +547,8 @@ pub async fn handle_action_item_patch(
     let result = match body.action.as_str() {
         "ignore" => store.set_action_item_ignored(&id, true),
         "resolve" => store.set_action_item_resolved(&id, true),
+        "claim" => store.set_action_item_claimed(&id, true),
+        "unclaim" => store.set_action_item_claimed(&id, false),
         other => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -609,7 +611,7 @@ pub async fn handle_summaries_cached(State(state): State<Arc<AppState>>) -> impl
                     .get_pending_action_items(&s.channel_id)
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|a| crate::output::ActionItemSummary { id: a.id, text: a.text })
+                    .map(|a| crate::output::ActionItemSummary { id: a.id, text: a.text, claimed: a.claimed })
                     .collect();
                 crate::output::ChannelSummary {
                     action_items,

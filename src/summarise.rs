@@ -359,6 +359,7 @@ async fn summarise_channel(
             .map(|a| ActionItemSummary {
                 id: a.id,
                 text: a.text,
+                claimed: a.claimed,
             })
             .collect()
     } else {
@@ -369,6 +370,7 @@ async fn summarise_channel(
             .map(|(i, t)| ActionItemSummary {
                 id: format!("ephemeral-{i}"),
                 text: t.clone(),
+                claimed: false,
             })
             .collect()
     };

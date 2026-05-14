@@ -19,9 +19,10 @@
   import PriorityUsersForm from "./lib/PriorityUsersForm.svelte";
   import SummarisePage from "./pages/SummarisePage.svelte";
   import InsightsPage from "./pages/InsightsPage.svelte";
+  import ActionsPage from "./pages/ActionsPage.svelte";
   import { startTour, startTourIfNew } from "./lib/ProductTour";
 
-  type Page = "summarise" | "insights";
+  type Page = "summarise" | "insights" | "actions";
 
   let currentPage: Page = $state("summarise");
   let showWizard = $state(false);
@@ -217,6 +218,32 @@
           />
         </svg>
       </Navigation.Tile>
+
+      <!-- Actions -->
+      <Navigation.Tile
+        id="actions"
+        label="Actions"
+        title="Action items across channels"
+        width="w-full"
+        padding="px-1 py-2"
+        gap="gap-1"
+        rounded="rounded-lg"
+        hover="hover:bg-gray-700/60"
+        active="bg-gray-700/80"
+        labelBase="text-[10px] leading-tight text-center"
+      >
+        <!-- Clipboard-check icon -->
+        <svg
+          viewBox="0 0 24 24"
+          class="w-5 h-5 fill-none stroke-current mx-auto"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <polyline points="9 11 12 14 22 4" />
+          <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+        </svg>
+      </Navigation.Tile>
     {/snippet}
 
     {#snippet footer()}
@@ -288,7 +315,7 @@
       <span
         class="text-xs font-semibold uppercase tracking-widest text-gray-400"
       >
-        {currentPage === "summarise" ? "Summarise" : "Insights"}
+        {currentPage === "summarise" ? "Summarise" : currentPage === "insights" ? "Insights" : "Actions"}
       </span>
 
       {#snippet trail()}
@@ -427,13 +454,16 @@
       {/snippet}
     </AppBar>
 
-    <!-- Page content — both pages are always mounted to preserve state -->
+    <!-- Page content — all pages are always mounted to preserve state -->
     <main class="flex-1 overflow-y-auto bg-gray-950">
       <div class:hidden={currentPage !== "summarise"}>
         <SummarisePage />
       </div>
       <div class:hidden={currentPage !== "insights"}>
         <InsightsPage {userRole} />
+      </div>
+      <div class:hidden={currentPage !== "actions"}>
+        <ActionsPage />
       </div>
     </main>
   </div>

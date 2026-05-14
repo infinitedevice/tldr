@@ -26,6 +26,7 @@ pub struct ActionItem {
     pub created_at: i64,
     pub resolved: bool,
     pub ignored: bool,
+    pub claimed: bool,
 }
 
 /// A per-channel insight snapshot stored after each summarise run.
@@ -139,6 +140,10 @@ impl Store {
             "ALTER TABLE channel_insights ADD COLUMN mention_count INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE action_item ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -230,7 +235,7 @@ impl Store {
     pub fn get_pending_action_items(&self, channel_id: &str) -> Result<Vec<ActionItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, channel_id, text, created_at, resolved, ignored
+            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed
              FROM action_item
              WHERE channel_id = ?1 AND resolved = 0 AND ignored = 0
              ORDER BY created_at",
@@ -244,6 +249,7 @@ impl Store {
                     created_at: row.get(3)?,
                     resolved: row.get::<_, i64>(4)? != 0,
                     ignored: row.get::<_, i64>(5)? != 0,
+                    claimed: row.get::<_, i64>(6)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -255,7 +261,7 @@ impl Store {
     pub fn get_all_action_items(&self, channel_id: &str) -> Result<Vec<ActionItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, channel_id, text, created_at, resolved, ignored
+            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed
              FROM action_item WHERE channel_id = ?1 ORDER BY created_at",
         )?;
         let items = stmt
@@ -267,6 +273,7 @@ impl Store {
                     created_at: row.get(3)?,
                     resolved: row.get::<_, i64>(4)? != 0,
                     ignored: row.get::<_, i64>(5)? != 0,
+                    claimed: row.get::<_, i64>(6)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -278,7 +285,7 @@ impl Store {
     pub fn get_all_action_items_global(&self) -> Result<Vec<ActionItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, channel_id, text, created_at, resolved, ignored
+            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed
              FROM action_item ORDER BY created_at",
         )?;
         let items = stmt
@@ -290,6 +297,7 @@ impl Store {
                     created_at: row.get(3)?,
                     resolved: row.get::<_, i64>(4)? != 0,
                     ignored: row.get::<_, i64>(5)? != 0,
+                    claimed: row.get::<_, i64>(6)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -319,6 +327,16 @@ impl Store {
             params![resolved as i64, now, id],
         )
         .context("failed to update action item resolved flag")?;
+        Ok(())
+    }
+
+    pub fn set_action_item_claimed(&self, id: &str, claimed: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE action_item SET claimed = ?1 WHERE id = ?2",
+            params![claimed as i64, id],
+        )
+        .context("failed to update action item claimed flag")?;
         Ok(())
     }
 
@@ -748,5 +766,42 @@ mod tests {
             all.get("sidebar_collapsed").map(|s| s.as_str()),
             Some("false"),
         );
+    }
+
+    #[test]
+    fn action_item_claim_and_unclaim() {
+        let s = test_store();
+        s.upsert_action_items("ch1", &["Task A".to_string()], 1000)
+            .unwrap();
+
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        let id = pending[0].id.clone();
+        assert!(!pending[0].claimed);
+
+        // Claiming keeps the item in the pending list (someone is working on it)
+        s.set_action_item_claimed(&id, true).unwrap();
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        assert_eq!(pending.len(), 1, "claimed item must still appear as pending");
+        assert!(pending[0].claimed);
+
+        // Unclaiming clears the flag
+        s.set_action_item_claimed(&id, false).unwrap();
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].claimed);
+    }
+
+    #[test]
+    fn action_item_claimed_visible_in_global_list() {
+        let s = test_store();
+        s.upsert_action_items("ch1", &["Task A".to_string()], 1000)
+            .unwrap();
+        let id = s.get_pending_action_items("ch1").unwrap()[0].id.clone();
+
+        s.set_action_item_claimed(&id, true).unwrap();
+
+        let global = s.get_all_action_items_global().unwrap();
+        assert_eq!(global.len(), 1);
+        assert!(global[0].claimed);
     }
 }
