@@ -17,6 +17,7 @@
     resolved: boolean;
     ignored: boolean;
     claimed: boolean;
+    source_ids?: string[];
   }
 
   let {
@@ -61,6 +62,14 @@
             {#if item.claimed}
               <span class="ml-1.5 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-900/60 text-blue-300 border border-blue-700/50">
                 claimed
+              </span>
+            {/if}
+            {#if item.source_ids && item.source_ids.length > 0}
+              <span
+                class="ml-1.5 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] text-gray-400 border border-gray-700/50"
+                title="{item.source_ids.length} source message{item.source_ids.length === 1 ? '' : 's'}"
+              >
+                📎 {item.source_ids.length}
               </span>
             {/if}
           </span>

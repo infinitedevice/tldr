@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::llm::LlmActionItem;
+
 /// A tracked action item extracted from a channel summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionItem {
@@ -30,6 +32,10 @@ pub struct ActionItem {
     /// Origin of this item: "mattermost" or "email".
     #[serde(default = "default_source")]
     pub source: String,
+    /// IDs of the source messages (Mattermost post IDs or email UIDs) that
+    /// triggered this action item.  Used for stable cross-cycle identity matching.
+    #[serde(default)]
+    pub source_ids: Vec<String>,
 }
 
 fn default_source() -> String {
@@ -174,6 +180,10 @@ impl Store {
             "ALTER TABLE action_item ADD COLUMN source TEXT NOT NULL DEFAULT 'mattermost'",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE action_item ADD COLUMN source_ids TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -240,40 +250,39 @@ impl Store {
 
     // --- Action items ---
 
-    /// Insert or update action items for a channel.
+    /// Reconcile action items for a channel with the LLM's latest output.
+    ///
+    /// Matching priority:
+    /// 1. **Source-ID overlap** — if a new item shares any message IDs with an
+    ///    existing item (pending or acted-on), it is an update of that item.
+    ///    The text is refreshed and the source_ids union is stored; the user's
+    ///    resolved/ignored/claimed state is preserved.
+    /// 2. **Text hash** — if no source-ID overlap is found, fall back to the
+    ///    sha256-based ID to match exact-text repeats.
+    /// 3. **New item** — if neither match, insert with a fresh hash-based ID.
+    ///
+    /// Pending items that were not matched by any incoming item are deleted
+    /// (treated as resolved by the LLM).  Items the user has acted on are
+    /// never deleted.
+    ///
     /// `source` should be "mattermost" or "email".
     pub fn upsert_action_items(
         &self,
         channel_id: &str,
-        texts: &[String],
+        items: &[LlmActionItem],
         created_at: i64,
         source: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        for text in texts {
-            let id = action_item_id(channel_id, text);
-            conn.execute(
-                "INSERT INTO action_item (id, channel_id, text, created_at, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(id) DO NOTHING",
-                params![id, channel_id, text, created_at, source],
-            )
-            .context("failed to upsert action item")?;
-        }
-        Ok(())
-    }
 
-    /// Pending items: not resolved, not ignored.
-    pub fn get_pending_action_items(&self, channel_id: &str) -> Result<Vec<ActionItem>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source
-             FROM action_item
-             WHERE channel_id = ?1 AND resolved = 0 AND ignored = 0
-             ORDER BY created_at",
-        )?;
-        let items = stmt
-            .query_map(params![channel_id], |row| {
+        // Snapshot all existing items for this channel (all states, not just pending).
+        let existing: Vec<ActionItem> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source, source_ids
+                 FROM action_item WHERE channel_id = ?1",
+            )?;
+            stmt.query_map(params![channel_id], |row| {
+                let ids_json: String = row.get(8)?;
                 Ok(ActionItem {
                     id: row.get(0)?,
                     channel_id: row.get(1)?,
@@ -283,6 +292,107 @@ impl Store {
                     ignored: row.get::<_, i64>(5)? != 0,
                     claimed: row.get::<_, i64>(6)? != 0,
                     source: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "mattermost".to_string()),
+                    source_ids: serde_json::from_str(&ids_json).unwrap_or_default(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to query action items")?
+        };
+
+        let mut matched_existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for item in items {
+            let new_src_set: std::collections::HashSet<&str> =
+                item.source_ids.iter().map(String::as_str).collect();
+
+            // Strategy 1: source-ID overlap
+            let match_by_src = if !new_src_set.is_empty() {
+                existing.iter().find(|e| {
+                    !matched_existing.contains(&e.id)
+                        && e.source_ids.iter().any(|s| new_src_set.contains(s.as_str()))
+                })
+            } else {
+                None
+            };
+
+            // Strategy 2: text-hash fallback
+            let target_id = action_item_id(channel_id, &item.text);
+            let match_by_hash = if match_by_src.is_none() {
+                existing
+                    .iter()
+                    .find(|e| !matched_existing.contains(&e.id) && e.id == target_id)
+            } else {
+                None
+            };
+
+            if let Some(existing_item) = match_by_src.or(match_by_hash) {
+                matched_existing.insert(existing_item.id.clone());
+
+                // Merge source_ids and refresh text.
+                let mut merged: std::collections::BTreeSet<String> =
+                    existing_item.source_ids.iter().cloned().collect();
+                merged.extend(item.source_ids.iter().cloned());
+                let merged_json = serde_json::to_string(&merged.into_iter().collect::<Vec<_>>())
+                    .unwrap_or_else(|_| "[]".to_string());
+
+                conn.execute(
+                    "UPDATE action_item SET text = ?1, source_ids = ?2 WHERE id = ?3",
+                    params![item.text, merged_json, existing_item.id],
+                )
+                .context("failed to update action item")?;
+            } else {
+                // New item — insert with hash-based ID.
+                let src_json = serde_json::to_string(&item.source_ids)
+                    .unwrap_or_else(|_| "[]".to_string());
+                conn.execute(
+                    "INSERT INTO action_item (id, channel_id, text, created_at, source, source_ids)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![target_id, channel_id, item.text, created_at, source, src_json],
+                )
+                .context("failed to insert action item")?;
+                matched_existing.insert(target_id);
+            }
+        }
+
+        // Delete pending items that were not matched (LLM considers them resolved).
+        // Items the user has acted on (resolved/ignored/claimed) are never deleted.
+        for existing_item in &existing {
+            if !matched_existing.contains(&existing_item.id)
+                && !existing_item.resolved
+                && !existing_item.ignored
+                && !existing_item.claimed
+            {
+                conn.execute("DELETE FROM action_item WHERE id = ?1", params![existing_item.id])
+                    .context("failed to delete stale action item")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Pending items: not resolved, not ignored.
+    pub fn get_pending_action_items(&self, channel_id: &str) -> Result<Vec<ActionItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source, source_ids
+             FROM action_item
+             WHERE channel_id = ?1 AND resolved = 0 AND ignored = 0
+             ORDER BY created_at",
+        )?;
+        let items = stmt
+            .query_map(params![channel_id], |row| {
+                let ids_json: String = row.get(8)?;
+                Ok(ActionItem {
+                    id: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    text: row.get(2)?,
+                    created_at: row.get(3)?,
+                    resolved: row.get::<_, i64>(4)? != 0,
+                    ignored: row.get::<_, i64>(5)? != 0,
+                    claimed: row.get::<_, i64>(6)? != 0,
+                    source: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "mattermost".to_string()),
+                    source_ids: serde_json::from_str(&ids_json).unwrap_or_default(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -294,11 +404,12 @@ impl Store {
     pub fn get_all_action_items(&self, channel_id: &str) -> Result<Vec<ActionItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source
+            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source, source_ids
              FROM action_item WHERE channel_id = ?1 ORDER BY created_at",
         )?;
         let items = stmt
             .query_map(params![channel_id], |row| {
+                let ids_json: String = row.get(8)?;
                 Ok(ActionItem {
                     id: row.get(0)?,
                     channel_id: row.get(1)?,
@@ -308,6 +419,7 @@ impl Store {
                     ignored: row.get::<_, i64>(5)? != 0,
                     claimed: row.get::<_, i64>(6)? != 0,
                     source: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "mattermost".to_string()),
+                    source_ids: serde_json::from_str(&ids_json).unwrap_or_default(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -319,11 +431,12 @@ impl Store {
     pub fn get_all_action_items_global(&self) -> Result<Vec<ActionItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source
+            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source, source_ids
              FROM action_item ORDER BY created_at",
         )?;
         let items = stmt
             .query_map([], |row| {
+                let ids_json: String = row.get(8)?;
                 Ok(ActionItem {
                     id: row.get(0)?,
                     channel_id: row.get(1)?,
@@ -333,6 +446,7 @@ impl Store {
                     ignored: row.get::<_, i64>(5)? != 0,
                     claimed: row.get::<_, i64>(6)? != 0,
                     source: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "mattermost".to_string()),
+                    source_ids: serde_json::from_str(&ids_json).unwrap_or_default(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -782,6 +896,25 @@ mod tests {
         Store::open(Path::new(":memory:")).expect("open in-memory store")
     }
 
+    /// Convenience: build `Vec<LlmActionItem>` from plain text strings (no source_ids).
+    fn items(texts: &[&str]) -> Vec<LlmActionItem> {
+        texts
+            .iter()
+            .map(|t| LlmActionItem {
+                text: t.to_string(),
+                source_ids: vec![],
+            })
+            .collect()
+    }
+
+    /// Convenience: build a single `LlmActionItem` with source IDs.
+    fn item_with_src(text: &str, srcs: &[&str]) -> LlmActionItem {
+        LlmActionItem {
+            text: text.to_string(),
+            source_ids: srcs.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
     #[test]
     fn watermark_round_trip() {
         let s = test_store();
@@ -815,8 +948,8 @@ mod tests {
     #[test]
     fn action_items_upsert_and_pending() {
         let s = test_store();
-        let items = vec!["Fix bug".to_string(), "Deploy v2".to_string()];
-        s.upsert_action_items("ch1", &items, 1000, "mattermost").unwrap();
+        s.upsert_action_items("ch1", &items(&["Fix bug", "Deploy v2"]), 1000, "mattermost")
+            .unwrap();
 
         let pending = s.get_pending_action_items("ch1").unwrap();
         assert_eq!(pending.len(), 2);
@@ -827,22 +960,103 @@ mod tests {
     #[test]
     fn action_items_dedup() {
         let s = test_store();
-        let items = vec!["Fix bug".to_string()];
-        s.upsert_action_items("ch1", &items, 1000, "mattermost").unwrap();
-        s.upsert_action_items("ch1", &items, 2000, "mattermost").unwrap();
+        s.upsert_action_items("ch1", &items(&["Fix bug"]), 1000, "mattermost")
+            .unwrap();
+        s.upsert_action_items("ch1", &items(&["Fix bug"]), 2000, "mattermost")
+            .unwrap();
 
         let all = s.get_all_action_items("ch1").unwrap();
         assert_eq!(all.len(), 1);
     }
 
     #[test]
-    fn action_item_resolve_and_ignore() {
+    fn action_items_replace_stale_pending() {
         let s = test_store();
-        let items = vec!["Task A".to_string()];
-        s.upsert_action_items("ch1", &items, 1000, "mattermost").unwrap();
+        s.upsert_action_items("ch1", &items(&["Task A", "Task B"]), 1000, "mattermost")
+            .unwrap();
+        // Second cycle: Task A dropped, Task C added
+        s.upsert_action_items("ch1", &items(&["Task B", "Task C"]), 2000, "mattermost")
+            .unwrap();
 
         let pending = s.get_pending_action_items("ch1").unwrap();
-        let id = &pending[0].id;
+        assert_eq!(pending.len(), 2, "stale Task A should be gone");
+        assert!(pending.iter().any(|i| i.text == "Task B"));
+        assert!(pending.iter().any(|i| i.text == "Task C"));
+    }
+
+    #[test]
+    fn action_items_preserve_acted_on_across_replace() {
+        let s = test_store();
+        s.upsert_action_items("ch1", &items(&["Task A", "Task B"]), 1000, "mattermost")
+            .unwrap();
+
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        let id_a = pending
+            .iter()
+            .find(|i| i.text == "Task A")
+            .unwrap()
+            .id
+            .clone();
+        s.set_action_item_resolved(&id_a, true).unwrap();
+
+        // Next cycle omits Task A — resolved items must survive the replace
+        s.upsert_action_items("ch1", &items(&["Task B"]), 2000, "mattermost")
+            .unwrap();
+
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].text, "Task B");
+        let all = s.get_all_action_items("ch1").unwrap();
+        assert!(
+            all.iter().any(|i| i.text == "Task A" && i.resolved),
+            "resolved Task A must be preserved"
+        );
+    }
+
+    #[test]
+    fn action_item_source_id_matching() {
+        let s = test_store();
+        s.upsert_action_items(
+            "ch1",
+            &[item_with_src("Do the thing", &["msg1", "msg2"])],
+            1000,
+            "mattermost",
+        )
+        .unwrap();
+
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        assert_eq!(pending.len(), 1);
+        let id_before = pending[0].id.clone();
+
+        // Next cycle: same messages, slightly rephrased text
+        s.upsert_action_items(
+            "ch1",
+            &[item_with_src("Do the thing now.", &["msg1", "msg3"])],
+            2000,
+            "mattermost",
+        )
+        .unwrap();
+
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        assert_eq!(pending.len(), 1, "rephrased item should not duplicate");
+        assert_eq!(pending[0].id, id_before, "ID should be preserved");
+        assert_eq!(pending[0].text, "Do the thing now.", "text should be updated");
+        let src_set: std::collections::HashSet<&str> =
+            pending[0].source_ids.iter().map(String::as_str).collect();
+        assert!(
+            src_set.contains("msg1") && src_set.contains("msg2") && src_set.contains("msg3"),
+            "source_ids should be merged"
+        );
+    }
+
+    #[test]
+    fn action_item_resolve_and_ignore() {
+        let s = test_store();
+        s.upsert_action_items("ch1", &items(&["Task A"]), 1000, "mattermost")
+            .unwrap();
+
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        let id = &pending[0].id.clone();
 
         s.set_action_item_resolved(id, true).unwrap();
         assert!(s.get_pending_action_items("ch1").unwrap().is_empty());

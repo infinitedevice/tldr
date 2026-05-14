@@ -391,6 +391,7 @@ mod tests {
             mattermost: MattermostConfig {
                 server_url: "https://chat.example.com".into(),
                 token: "tok".into(),
+                ..Default::default()
             },
             llm: LlmConfig {
                 base_url: "https://llm.example.com".into(),
@@ -436,6 +437,7 @@ token = "x"
             mattermost: MattermostConfig {
                 server_url: "https://chat.example.com".into(),
                 token: "tok".into(),
+                ..Default::default()
             },
             llm: LlmConfig {
                 base_url: "https://llm.example.com".into(),

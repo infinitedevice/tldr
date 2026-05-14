@@ -20,6 +20,9 @@ pub struct ActionItemSummary {
     pub text: String,
     #[serde(default)]
     pub claimed: bool,
+    /// IDs of the source messages that triggered this action item.
+    #[serde(default)]
+    pub source_ids: Vec<String>,
 }
 
 /// A named topic section within a channel summary, with pre-rendered HTML.

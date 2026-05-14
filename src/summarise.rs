@@ -437,6 +437,7 @@ async fn summarise_channel(
                 id: a.id,
                 text: a.text,
                 claimed: a.claimed,
+                source_ids: a.source_ids,
             })
             .collect()
     } else {
@@ -444,10 +445,11 @@ async fn summarise_channel(
             .action_items
             .iter()
             .enumerate()
-            .map(|(i, t)| ActionItemSummary {
+            .map(|(i, a)| ActionItemSummary {
                 id: format!("ephemeral-{i}"),
-                text: t.clone(),
+                text: a.text.clone(),
                 claimed: false,
+                source_ids: a.source_ids.clone(),
             })
             .collect()
     };
@@ -505,7 +507,7 @@ async fn summarise_channel(
             channel_name: channel_display_name.clone(),
             team_name: team_name.clone(),
             summary_text,
-            action_items: llm_result.action_items.clone(),
+            action_items: llm_result.action_items.iter().map(|a| a.text.clone()).collect(),
             topics: insight_topics,
             importance_score: 0.0,
             risk_score: 0.0,
@@ -648,6 +650,7 @@ async fn build_formatted(
             .unwrap_or_else(|| "unknown".to_string());
 
         result.push(FormattedMessage {
+            id: post.id.clone(),
             timestamp: ts,
             username: format!("{display} (@{uname})"),
             content: post.message.clone(),

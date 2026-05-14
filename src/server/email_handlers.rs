@@ -41,6 +41,7 @@ pub async fn handle_email_summaries_cached(
                     id: a.id,
                     text: a.text,
                     claimed: a.claimed,
+                    source_ids: a.source_ids,
                 })
                 .collect();
             s.action_items = live_items;

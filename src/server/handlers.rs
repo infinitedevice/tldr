@@ -618,7 +618,7 @@ pub async fn handle_summaries_cached(State(state): State<Arc<AppState>>) -> impl
                     .get_pending_action_items(&s.channel_id)
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|a| crate::output::ActionItemSummary { id: a.id, text: a.text, claimed: a.claimed })
+                    .map(|a| crate::output::ActionItemSummary { id: a.id, text: a.text, claimed: a.claimed, source_ids: a.source_ids })
                     .collect();
                 crate::output::ChannelSummary {
                     action_items,

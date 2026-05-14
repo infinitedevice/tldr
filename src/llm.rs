@@ -78,6 +78,8 @@ struct MessageContent {
 }
 
 pub struct FormattedMessage {
+    /// Stable message ID (Mattermost post ID or email UID string).
+    pub id: String,
     pub timestamp: String,
     /// Full display string, e.g. "John Doe (@jdoe)"
     pub username: String,
@@ -111,6 +113,52 @@ where
     }
 }
 
+/// Accepts either a plain string or a `{text, source_ids}` object.
+/// Older model outputs and fallback paths may emit plain strings; this ensures
+/// forward and backward compatibility without failing the whole parse.
+fn deserialize_action_items<'de, D>(
+    de: D,
+) -> std::result::Result<Vec<LlmActionItem>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Vec<serde_json::Value> = Vec::deserialize(de)?;
+    Ok(raw
+        .into_iter()
+        .map(|v| match v {
+            serde_json::Value::String(s) => LlmActionItem {
+                text: s,
+                source_ids: vec![],
+            },
+            obj => serde_json::from_value::<LlmActionItem>(obj).unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// A single action item extracted by the LLM, with optional source message IDs.
+///
+/// The `source_ids` list contains the IDs of the messages that triggered this
+/// action (Mattermost post IDs or email UIDs as strings).  The store uses these
+/// for stable identity matching across summarise cycles: if a new item shares
+/// source IDs with an existing item, it is treated as an update rather than a
+/// duplicate, regardless of minor text rephrasing by the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmActionItem {
+    pub text: String,
+    #[serde(default)]
+    pub source_ids: Vec<String>,
+}
+
+/// A single email message passed to [`LlmClient::summarise_emails`].
+pub struct EmailInput {
+    /// Stable identifier (UID as string).
+    pub id: String,
+    pub from: String,
+    pub subject: String,
+    pub date: String,
+    pub body: String,
+}
+
 /// A single named topic within a channel summary.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TopicPoint {
@@ -129,8 +177,8 @@ pub struct LlmSummary {
     /// Flat summary kept for backward-compat fallback (old responses / parse failures).
     #[serde(deserialize_with = "deserialize_string_or_vec", default)]
     pub summary: String,
-    #[serde(default)]
-    pub action_items: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_action_items")]
+    pub action_items: Vec<LlmActionItem>,
     /// Short one-line topic inferred by the LLM; only requested for DM/group channels.
     #[serde(default)]
     pub topic: Option<String>,
@@ -199,7 +247,7 @@ impl LlmClient {
 
         let fmt = |msgs: &[FormattedMessage]| -> String {
             msgs.iter()
-                .map(|m| format!("[{}] {}: {}", m.timestamp, m.username, m.content))
+                .map(|m| format!("[{}][{}] {}: {}", m.id, m.timestamp, m.username, m.content))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -262,17 +310,20 @@ impl LlmClient {
             "You are a concise chat summariser. \
             When a [CONTEXT] section is present, use it only as background — do not summarise it. \
             Focus your summary on the messages after '--- unread messages ---'. \
+            Each message is prefixed with its stable ID in the first bracket, e.g. \
+            `[abc123][2024-01-01 10:00] Alice (@alice): hello`. \
             If [OPEN ACTION ITEMS] are listed, note which appear resolved vs still pending in your summary. \
             IMPORTANT: Always refer to people by their actual display name as it appears in the messages \
             (format \"Display Name (@username)\") — never write \"a user\", \"a participant\", or \
             \"someone\". \
             Respond with ONLY a JSON object — no markdown fences, no preamble. \
             Format: {{\"topics\": [{{\"title\": \"Short topic title\", \"summary\": \"- bullet\\n- bullet\"}}], \
-            \"action_items\": [\"item 1\", \"item 2\"]{topic_schema}}}. \
+            \"action_items\": [{{\"text\": \"short imperative sentence\", \"source_ids\": [\"id1\", \"id2\"]}}]{topic_schema}}}. \
             Group the conversation into 1–5 named topic sections. Each topic's summary field uses \
             markdown bullet points (start each point with \"- \"). \
-            The action_items array contains only new or still-pending action items, \
-            as short imperative sentences.{topic_instruction}"
+            The action_items array contains only new or still-pending action items as short imperative \
+            sentences. Each action item must list the IDs of the messages it was derived from in \
+            source_ids.{topic_instruction}"
         );
 
         if !priority_users.is_empty() {
@@ -343,13 +394,13 @@ impl LlmClient {
 
     /// Summarise a batch of emails from a mailbox.
     ///
-    /// `emails` is a list of `(from, subject, date, body)` tuples.  Returns the
-    /// same [`LlmSummary`] format as [`Self::summarise`], with topics and action items.
+    /// Returns the same [`LlmSummary`] format as [`Self::summarise`], with topics and
+    /// action items that include `source_ids` referencing email UIDs.
     /// `extra_instructions` is optional per-mailbox context injected into the system prompt.
     pub async fn summarise_emails(
         &self,
         mailbox_name: &str,
-        emails: &[(String, String, String, String)], // (from, subject, date, body)
+        emails: &[EmailInput],
         prior_action_items: &[String],
         extra_instructions: Option<&str>,
     ) -> Result<(LlmSummary, String)> {
@@ -359,10 +410,11 @@ impl LlmClient {
 
         let email_text = emails
             .iter()
-            .map(|(from, subject, date, body)| {
-                let trimmed_body = body.chars().take(1500).collect::<String>();
+            .map(|e| {
+                let trimmed_body = e.body.chars().take(1500).collect::<String>();
                 format!(
-                    "---\nFrom: {from}\nSubject: {subject}\nDate: {date}\n\n{trimmed_body}"
+                    "---\n[{}]\nFrom: {}\nSubject: {}\nDate: {}\n\n{}",
+                    e.id, e.from, e.subject, e.date, trimmed_body
                 )
             })
             .collect::<Vec<_>>()
@@ -384,16 +436,18 @@ impl LlmClient {
         let mut system_prompt =
             "You are a concise email summariser. \
             Summarise the provided emails, grouping related threads by topic. \
+            Each email is prefixed with its stable UID in square brackets, e.g. `[42]`. \
             IMPORTANT: Always include the sender's email address and the subject line when \
             referring to specific emails. Never write \"a sender\" or \"someone\" — always \
             use the actual name and address from the From header. \
             Respond with ONLY a JSON object — no markdown fences, no preamble. \
             Format: {\"topics\": [{\"title\": \"Short topic title\", \"summary\": \"- bullet\\n- bullet\"}], \
-            \"action_items\": [\"item 1\", \"item 2\"]}. \
+            \"action_items\": [{\"text\": \"short imperative sentence\", \"source_ids\": [\"42\", \"43\"]}]}. \
             Group emails into 1–5 named topic sections. Each topic's summary field uses \
             markdown bullet points (start each point with \"- \"). \
-            The action_items array contains only new or still-pending action items from the emails, \
-            as short imperative sentences."
+            The action_items array contains only new or still-pending action items from the emails \
+            as short imperative sentences. Each action item must list the UIDs of the emails it \
+            was derived from in source_ids."
             .to_string();
 
         if let Some(instructions) = extra_instructions

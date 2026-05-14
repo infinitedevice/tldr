@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use crate::config::EmailConfig;
 use crate::email::ImapClient;
-use crate::llm::LlmClient;
+use crate::llm::{EmailInput, LlmClient};
 use crate::output::{ActionItemSummary, EmailMeta, EmailSummary, TopicSection};
 use crate::store::Store;
 use crate::summarise::markdown_to_html;
@@ -76,10 +76,16 @@ async fn summarise_mailbox(
     let unread_count = messages.len();
     let max_uid = messages.iter().map(|m| m.uid).max().unwrap_or(0);
 
-    // Build (from, subject, date, body) tuples for the LLM
-    let email_tuples: Vec<(String, String, String, String)> = messages
+    // Build EmailInput structs for the LLM (includes stable UID for source tracking)
+    let email_inputs: Vec<EmailInput> = messages
         .iter()
-        .map(|m| (m.from.clone(), m.subject.clone(), m.date.clone(), m.body.clone()))
+        .map(|m| EmailInput {
+            id: m.uid.to_string(),
+            from: m.from.clone(),
+            subject: m.subject.clone(),
+            date: m.date.clone(),
+            body: m.body.clone(),
+        })
         .collect();
 
     let email_metas: Vec<EmailMeta> = messages
@@ -103,7 +109,7 @@ async fn summarise_mailbox(
     let _permit = llm_sem.acquire().await.context("LLM semaphore closed")?;
 
     let (llm_result, _raw) = llm
-        .summarise_emails(mailbox, &email_tuples, &prior_items, instructions)
+        .summarise_emails(mailbox, &email_inputs, &prior_items, instructions)
         .await
         .with_context(|| format!("LLM summarise_emails failed for {mailbox}"))?;
 
@@ -128,6 +134,7 @@ async fn summarise_mailbox(
             id: a.id,
             text: a.text,
             claimed: a.claimed,
+            source_ids: a.source_ids,
         })
         .collect();
 

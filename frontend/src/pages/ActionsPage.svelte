@@ -22,6 +22,7 @@
     ignored: boolean;
     claimed: boolean;
     source?: string;
+    source_ids?: string[];
   }
 
   interface TopicSection {
