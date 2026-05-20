@@ -234,6 +234,7 @@ async fn seed_channel(
                     .or_insert_with(|| p.user_id.clone())
                     .clone();
                 FormattedMessage {
+                    id: p.id.clone(),
                     timestamp: ts,
                     username,
                     content: p.message.clone(),
@@ -267,7 +268,7 @@ async fn seed_channel(
             drop(p);
         };
         match llm
-            .summarise(channel_name, &[], &window_posts, &[], &[], false, None)
+            .summarise(channel_name, &[], &window_posts, &[], &[], false, None, None)
             .await
         {
             Ok((result, _raw)) => {
@@ -291,7 +292,7 @@ async fn seed_channel(
                     channel_name: channel_name.to_string(),
                     team_name: team_name.to_string(),
                     summary_text,
-                    action_items: result.action_items,
+                    action_items: result.action_items.iter().map(|a| a.text.clone()).collect(),
                     topics: insight_topics,
                     importance_score: 0.0,
                     risk_score: 0.0,

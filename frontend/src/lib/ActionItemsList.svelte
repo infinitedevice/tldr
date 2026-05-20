@@ -6,7 +6,7 @@
   /**
    * @component ActionItemsList
    * Displays pending action items for a channel and provides
-   * Ignore / Done buttons that PATCH `/api/v1/action-items/{id}`.
+   * Claim / Ignore / Done buttons that PATCH `/api/v1/action-items/{id}`.
    */
 
   interface ActionItem {
@@ -16,6 +16,8 @@
     created_at: number;
     resolved: boolean;
     ignored: boolean;
+    claimed: boolean;
+    source_ids?: string[];
   }
 
   let {
@@ -30,7 +32,7 @@
 
   const pending = $derived(items.filter((i) => !i.resolved && !i.ignored));
 
-  async function patchItem(id: string, action: "ignore" | "resolve") {
+  async function patchItem(id: string, action: "ignore" | "resolve" | "claim" | "unclaim") {
     await fetch(`/api/v1/action-items/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -55,7 +57,39 @@
       {#each pending as item (item.id)}
         <li class="flex items-start gap-2 text-sm text-yellow-200">
           <span class="mt-0.5 shrink-0" aria-hidden="true">→</span>
-          <span class="flex-1">{item.text}</span>
+          <span class="flex-1">
+            {item.text}
+            {#if item.claimed}
+              <span class="ml-1.5 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-900/60 text-blue-300 border border-blue-700/50">
+                claimed
+              </span>
+            {/if}
+            {#if item.source_ids && item.source_ids.length > 0}
+              <span
+                class="ml-1.5 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] text-gray-400 border border-gray-700/50"
+                title="{item.source_ids.length} source message{item.source_ids.length === 1 ? '' : 's'}"
+              >
+                📎 {item.source_ids.length}
+              </span>
+            {/if}
+          </span>
+          {#if item.claimed}
+            <button
+              onclick={() => patchItem(item.id, "unclaim")}
+              class="shrink-0 text-xs text-blue-400 hover:text-blue-200 transition-colors"
+              aria-label="Unclaim this action item: {item.text}"
+            >
+              Unclaim
+            </button>
+          {:else}
+            <button
+              onclick={() => patchItem(item.id, "claim")}
+              class="shrink-0 text-xs text-blue-500 hover:text-blue-300 transition-colors"
+              aria-label="Claim this action item: {item.text}"
+            >
+              Claim
+            </button>
+          {/if}
           <button
             onclick={() => patchItem(item.id, "ignore")}
             class="shrink-0 text-xs text-gray-500 hover:text-gray-300 transition-colors"

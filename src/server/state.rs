@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::{RwLock, Semaphore, broadcast};
 
-use crate::config::Config;
+use crate::config::{Config, MailboxConfig, MmChannelConfig, MmTeamConfig};
 use crate::llm::LlmClient;
 use crate::mattermost::MattermostClient;
 use crate::rag::VectorStore;
@@ -45,10 +45,21 @@ pub struct AppState {
     pub summarise_active: Arc<AtomicUsize>,
     /// In-memory seeding progress, updated by the background seeding task.
     pub seeding_progress: Arc<RwLock<SeedingProgress>>,
-    /// In-memory cache of latest channel summaries (populated by background loop + on-demand).
+    /// In-memory cache of latest Mattermost channel summaries.
     pub summary_cache: Arc<RwLock<Vec<crate::output::ChannelSummary>>>,
-    /// Broadcast channel for real-time SSE updates when a summary changes.
+    /// Broadcast channel for real-time SSE updates when a Mattermost summary changes.
     pub summary_tx: broadcast::Sender<crate::output::ChannelSummary>,
+    /// In-memory cache of latest email mailbox summaries.
+    pub email_cache: Arc<RwLock<Vec<crate::output::EmailSummary>>>,
+    /// Broadcast channel for real-time SSE updates when an email summary changes.
+    pub email_tx: broadcast::Sender<crate::output::EmailSummary>,
+
+    // ── Mutable source configuration ─────────────────────────────────────
+    // These are updated by PATCH /api/v1/config/sources and read by the
+    // background summarise loops each cycle, so changes take effect without restart.
+    pub mm_channel_config: Arc<RwLock<Vec<MmChannelConfig>>>,
+    pub mm_team_config: Arc<RwLock<Vec<MmTeamConfig>>>,
+    pub email_mailbox_config: Arc<RwLock<Vec<MailboxConfig>>>,
 }
 
 /// Live progress of the first-run history seeding task.

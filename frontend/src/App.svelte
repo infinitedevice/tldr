@@ -19,11 +19,14 @@
   import PriorityUsersForm from "./lib/PriorityUsersForm.svelte";
   import SummarisePage from "./pages/SummarisePage.svelte";
   import InsightsPage from "./pages/InsightsPage.svelte";
+  import ActionsPage from "./pages/ActionsPage.svelte";
+  import EmailPage from "./pages/EmailPage.svelte";
+  import SourcesPage from "./pages/SourcesPage.svelte";
   import { startTour, startTourIfNew } from "./lib/ProductTour";
 
-  type Page = "summarise" | "insights";
+  type Page = "chat" | "insights" | "actions" | "email" | "sources";
 
-  let currentPage: Page = $state("summarise");
+  let currentPage: Page = $state("insights");
   let showWizard = $state(false);
   let configAllowCancel = $state(false);
   let showUserMenu = $state(false);
@@ -161,36 +164,6 @@
     tilesClasses="flex-1 pt-2"
   >
     {#snippet tiles()}
-      <!-- Summarise -->
-      <Navigation.Tile
-        id="summarise"
-        label="Summarise"
-        title="Summarise unread channels"
-        width="w-full"
-        padding="px-1 py-2"
-        gap="gap-1"
-        rounded="rounded-lg"
-        hover="hover:bg-gray-700/60"
-        active="bg-gray-700/80"
-        labelBase="text-[10px] leading-tight text-center"
-      >
-        <!-- List icon -->
-        <svg
-          viewBox="0 0 24 24"
-          class="w-5 h-5 fill-none stroke-current mx-auto"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        >
-          <line x1="8" y1="6" x2="21" y2="6" />
-          <line x1="8" y1="12" x2="21" y2="12" />
-          <line x1="8" y1="18" x2="13" y2="18" />
-          <circle cx="3" cy="6" r="1" fill="currentColor" />
-          <circle cx="3" cy="12" r="1" fill="currentColor" />
-          <circle cx="3" cy="18" r="1" fill="currentColor" />
-        </svg>
-      </Navigation.Tile>
-
       <!-- Insights -->
       <Navigation.Tile
         id="insights"
@@ -217,9 +190,103 @@
           />
         </svg>
       </Navigation.Tile>
+
+      <!-- Chat -->
+      <Navigation.Tile
+        id="chat"
+        label="Chat"
+        title="Mattermost channel summaries"
+        width="w-full"
+        padding="px-1 py-2"
+        gap="gap-1"
+        rounded="rounded-lg"
+        hover="hover:bg-gray-700/60"
+        active="bg-gray-700/80"
+        labelBase="text-[10px] leading-tight text-center"
+      >
+        <!-- Chat bubble icon -->
+        <svg
+          viewBox="0 0 24 24"
+          class="w-5 h-5 fill-none stroke-current mx-auto"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+        </svg>
+      </Navigation.Tile>
+
+      <!-- Email -->
+      <Navigation.Tile
+        id="email"
+        label="Email"
+        title="Email summaries"
+        width="w-full"
+        padding="px-1 py-2"
+        gap="gap-1"
+        rounded="rounded-lg"
+        hover="hover:bg-gray-700/60"
+        active="bg-gray-700/80"
+        labelBase="text-[10px] leading-tight text-center"
+      >
+        <!-- Envelope icon -->
+        <svg
+          viewBox="0 0 24 24"
+          class="w-5 h-5 fill-none stroke-current mx-auto"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <rect x="2" y="4" width="20" height="16" rx="2" />
+          <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
+        </svg>
+      </Navigation.Tile>
+
+      <!-- Actions -->
+      <Navigation.Tile
+        id="actions"
+        label="Actions"
+        title="Action items across channels"
+        width="w-full"
+        padding="px-1 py-2"
+        gap="gap-1"
+        rounded="rounded-lg"
+        hover="hover:bg-gray-700/60"
+        active="bg-gray-700/80"
+        labelBase="text-[10px] leading-tight text-center"
+      >
+        <!-- Clipboard-check icon -->
+        <svg
+          viewBox="0 0 24 24"
+          class="w-5 h-5 fill-none stroke-current mx-auto"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <polyline points="9 11 12 14 22 4" />
+          <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+        </svg>
+      </Navigation.Tile>
     {/snippet}
 
     {#snippet footer()}
+      <!-- Sources config button -->
+      <button
+        onclick={() => (currentPage = "sources")}
+        title="Configure sources"
+        data-tour="sources-btn"
+        class={`flex flex-col items-center gap-1 w-full px-1 py-2 rounded-lg transition-colors ${currentPage === "sources" ? "text-cyan-400 bg-gray-700/60" : "text-gray-500 hover:text-gray-300 hover:bg-gray-700/40"}`}
+      >
+        <svg viewBox="0 0 24 24" class="w-4 h-4 fill-none stroke-current" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="4" y1="6" x2="20" y2="6"/>
+          <line x1="4" y1="12" x2="14" y2="12"/>
+          <line x1="4" y1="18" x2="17" y2="18"/>
+          <circle cx="20" cy="12" r="2"/>
+          <circle cx="17" cy="18" r="2"/>
+        </svg>
+        <span class="text-[9px] leading-tight">Sources</span>
+      </button>
+
       <!-- llms.txt link -->
       <a
         href="/llms.txt"
@@ -288,7 +355,7 @@
       <span
         class="text-xs font-semibold uppercase tracking-widest text-gray-400"
       >
-        {currentPage === "summarise" ? "Summarise" : "Insights"}
+        {currentPage === "chat" ? "Chat" : currentPage === "insights" ? "Insights" : currentPage === "actions" ? "Actions" : currentPage === "email" ? "Email" : "Sources"}
       </span>
 
       {#snippet trail()}
@@ -427,13 +494,22 @@
       {/snippet}
     </AppBar>
 
-    <!-- Page content — both pages are always mounted to preserve state -->
+    <!-- Page content — all pages are always mounted to preserve state -->
     <main class="flex-1 overflow-y-auto bg-gray-950">
-      <div class:hidden={currentPage !== "summarise"}>
+      <div class:hidden={currentPage !== "chat"}>
         <SummarisePage />
       </div>
       <div class:hidden={currentPage !== "insights"}>
         <InsightsPage {userRole} />
+      </div>
+      <div class:hidden={currentPage !== "actions"}>
+        <ActionsPage />
+      </div>
+      <div class:hidden={currentPage !== "email"}>
+        <EmailPage />
+      </div>
+      <div class:hidden={currentPage !== "sources"} class="h-full">
+        <SourcesPage />
       </div>
     </main>
   </div>

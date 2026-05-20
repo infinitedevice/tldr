@@ -9,6 +9,8 @@
 
 pub mod config;
 pub mod daemon;
+pub mod email;
+pub mod email_summarise;
 pub mod llm;
 pub mod mattermost;
 pub mod mattermost_types;

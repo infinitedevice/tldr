@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::llm::LlmActionItem;
+
 /// A tracked action item extracted from a channel summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionItem {
@@ -26,6 +28,18 @@ pub struct ActionItem {
     pub created_at: i64,
     pub resolved: bool,
     pub ignored: bool,
+    pub claimed: bool,
+    /// Origin of this item: "mattermost" or "email".
+    #[serde(default = "default_source")]
+    pub source: String,
+    /// IDs of the source messages (Mattermost post IDs or email UIDs) that
+    /// triggered this action item.  Used for stable cross-cycle identity matching.
+    #[serde(default)]
+    pub source_ids: Vec<String>,
+}
+
+fn default_source() -> String {
+    "mattermost".to_string()
 }
 
 /// A per-channel insight snapshot stored after each summarise run.
@@ -121,6 +135,25 @@ impl Store {
                 channel_id   TEXT PRIMARY KEY,
                 summary_json TEXT NOT NULL,
                 updated_at   INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS email_watermark (
+                mailbox    TEXT NOT NULL PRIMARY KEY,
+                last_uid   INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS cached_email_summary (
+                mailbox      TEXT NOT NULL PRIMARY KEY,
+                summary_json TEXT NOT NULL,
+                updated_at   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS source_config (
+                source_type  TEXT NOT NULL,
+                name         TEXT NOT NULL,
+                team         TEXT NOT NULL DEFAULT '',
+                enabled      INTEGER NOT NULL DEFAULT 1,
+                instructions TEXT,
+                updated_at   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (source_type, name, team)
             );",
         )
         .context("failed to initialise database schema")?;
@@ -137,6 +170,18 @@ impl Store {
         );
         let _ = conn.execute(
             "ALTER TABLE channel_insights ADD COLUMN mention_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE action_item ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE action_item ADD COLUMN source TEXT NOT NULL DEFAULT 'mattermost'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE action_item ADD COLUMN source_ids TEXT NOT NULL DEFAULT '[]'",
             [],
         );
 
@@ -205,38 +250,39 @@ impl Store {
 
     // --- Action items ---
 
-    /// Insert or update action items for a channel. ID is a content hash for deduplication.
+    /// Reconcile action items for a channel with the LLM's latest output.
+    ///
+    /// Matching priority:
+    /// 1. **Source-ID overlap** — if a new item shares any message IDs with an
+    ///    existing item (pending or acted-on), it is an update of that item.
+    ///    The text is refreshed and the source_ids union is stored; the user's
+    ///    resolved/ignored/claimed state is preserved.
+    /// 2. **Text hash** — if no source-ID overlap is found, fall back to the
+    ///    sha256-based ID to match exact-text repeats.
+    /// 3. **New item** — if neither match, insert with a fresh hash-based ID.
+    ///
+    /// Pending items that were not matched by any incoming item are deleted
+    /// (treated as resolved by the LLM).  Items the user has acted on are
+    /// never deleted.
+    ///
+    /// `source` should be "mattermost" or "email".
     pub fn upsert_action_items(
         &self,
         channel_id: &str,
-        texts: &[String],
+        items: &[LlmActionItem],
         created_at: i64,
+        source: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        for text in texts {
-            let id = action_item_id(channel_id, text);
-            conn.execute(
-                "INSERT INTO action_item (id, channel_id, text, created_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(id) DO NOTHING",
-                params![id, channel_id, text, created_at],
-            )
-            .context("failed to upsert action item")?;
-        }
-        Ok(())
-    }
 
-    /// Pending items: not resolved, not ignored.
-    pub fn get_pending_action_items(&self, channel_id: &str) -> Result<Vec<ActionItem>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, channel_id, text, created_at, resolved, ignored
-             FROM action_item
-             WHERE channel_id = ?1 AND resolved = 0 AND ignored = 0
-             ORDER BY created_at",
-        )?;
-        let items = stmt
-            .query_map(params![channel_id], |row| {
+        // Snapshot all existing items for this channel (all states, not just pending).
+        let existing: Vec<ActionItem> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source, source_ids
+                 FROM action_item WHERE channel_id = ?1",
+            )?;
+            stmt.query_map(params![channel_id], |row| {
+                let ids_json: String = row.get(8)?;
                 Ok(ActionItem {
                     id: row.get(0)?,
                     channel_id: row.get(1)?,
@@ -244,6 +290,109 @@ impl Store {
                     created_at: row.get(3)?,
                     resolved: row.get::<_, i64>(4)? != 0,
                     ignored: row.get::<_, i64>(5)? != 0,
+                    claimed: row.get::<_, i64>(6)? != 0,
+                    source: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "mattermost".to_string()),
+                    source_ids: serde_json::from_str(&ids_json).unwrap_or_default(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to query action items")?
+        };
+
+        let mut matched_existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for item in items {
+            let new_src_set: std::collections::HashSet<&str> =
+                item.source_ids.iter().map(String::as_str).collect();
+
+            // Strategy 1: source-ID overlap
+            let match_by_src = if !new_src_set.is_empty() {
+                existing.iter().find(|e| {
+                    !matched_existing.contains(&e.id)
+                        && e.source_ids.iter().any(|s| new_src_set.contains(s.as_str()))
+                })
+            } else {
+                None
+            };
+
+            // Strategy 2: text-hash fallback
+            let target_id = action_item_id(channel_id, &item.text);
+            let match_by_hash = if match_by_src.is_none() {
+                existing
+                    .iter()
+                    .find(|e| !matched_existing.contains(&e.id) && e.id == target_id)
+            } else {
+                None
+            };
+
+            if let Some(existing_item) = match_by_src.or(match_by_hash) {
+                matched_existing.insert(existing_item.id.clone());
+
+                // Merge source_ids and refresh text.
+                let mut merged: std::collections::BTreeSet<String> =
+                    existing_item.source_ids.iter().cloned().collect();
+                merged.extend(item.source_ids.iter().cloned());
+                let merged_json = serde_json::to_string(&merged.into_iter().collect::<Vec<_>>())
+                    .unwrap_or_else(|_| "[]".to_string());
+
+                conn.execute(
+                    "UPDATE action_item SET text = ?1, source_ids = ?2 WHERE id = ?3",
+                    params![item.text, merged_json, existing_item.id],
+                )
+                .context("failed to update action item")?;
+            } else {
+                // New item — insert with hash-based ID.
+                let src_json = serde_json::to_string(&item.source_ids)
+                    .unwrap_or_else(|_| "[]".to_string());
+                conn.execute(
+                    "INSERT INTO action_item (id, channel_id, text, created_at, source, source_ids)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![target_id, channel_id, item.text, created_at, source, src_json],
+                )
+                .context("failed to insert action item")?;
+                matched_existing.insert(target_id);
+            }
+        }
+
+        // Delete pending items that were not matched (LLM considers them resolved).
+        // Items the user has acted on (resolved/ignored/claimed) are never deleted.
+        for existing_item in &existing {
+            if !matched_existing.contains(&existing_item.id)
+                && !existing_item.resolved
+                && !existing_item.ignored
+                && !existing_item.claimed
+            {
+                conn.execute("DELETE FROM action_item WHERE id = ?1", params![existing_item.id])
+                    .context("failed to delete stale action item")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Pending items: not resolved, not ignored.
+    pub fn get_pending_action_items(&self, channel_id: &str) -> Result<Vec<ActionItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source, source_ids
+             FROM action_item
+             WHERE channel_id = ?1 AND resolved = 0 AND ignored = 0
+             ORDER BY created_at",
+        )?;
+        let items = stmt
+            .query_map(params![channel_id], |row| {
+                let ids_json: String = row.get(8)?;
+                Ok(ActionItem {
+                    id: row.get(0)?,
+                    channel_id: row.get(1)?,
+                    text: row.get(2)?,
+                    created_at: row.get(3)?,
+                    resolved: row.get::<_, i64>(4)? != 0,
+                    ignored: row.get::<_, i64>(5)? != 0,
+                    claimed: row.get::<_, i64>(6)? != 0,
+                    source: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "mattermost".to_string()),
+                    source_ids: serde_json::from_str(&ids_json).unwrap_or_default(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -255,11 +404,12 @@ impl Store {
     pub fn get_all_action_items(&self, channel_id: &str) -> Result<Vec<ActionItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, channel_id, text, created_at, resolved, ignored
+            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source, source_ids
              FROM action_item WHERE channel_id = ?1 ORDER BY created_at",
         )?;
         let items = stmt
             .query_map(params![channel_id], |row| {
+                let ids_json: String = row.get(8)?;
                 Ok(ActionItem {
                     id: row.get(0)?,
                     channel_id: row.get(1)?,
@@ -267,6 +417,9 @@ impl Store {
                     created_at: row.get(3)?,
                     resolved: row.get::<_, i64>(4)? != 0,
                     ignored: row.get::<_, i64>(5)? != 0,
+                    claimed: row.get::<_, i64>(6)? != 0,
+                    source: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "mattermost".to_string()),
+                    source_ids: serde_json::from_str(&ids_json).unwrap_or_default(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -278,11 +431,12 @@ impl Store {
     pub fn get_all_action_items_global(&self) -> Result<Vec<ActionItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, channel_id, text, created_at, resolved, ignored
+            "SELECT id, channel_id, text, created_at, resolved, ignored, claimed, source, source_ids
              FROM action_item ORDER BY created_at",
         )?;
         let items = stmt
             .query_map([], |row| {
+                let ids_json: String = row.get(8)?;
                 Ok(ActionItem {
                     id: row.get(0)?,
                     channel_id: row.get(1)?,
@@ -290,6 +444,9 @@ impl Store {
                     created_at: row.get(3)?,
                     resolved: row.get::<_, i64>(4)? != 0,
                     ignored: row.get::<_, i64>(5)? != 0,
+                    claimed: row.get::<_, i64>(6)? != 0,
+                    source: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "mattermost".to_string()),
+                    source_ids: serde_json::from_str(&ids_json).unwrap_or_default(),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -319,6 +476,16 @@ impl Store {
             params![resolved as i64, now, id],
         )
         .context("failed to update action item resolved flag")?;
+        Ok(())
+    }
+
+    pub fn set_action_item_claimed(&self, id: &str, claimed: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE action_item SET claimed = ?1 WHERE id = ?2",
+            params![claimed as i64, id],
+        )
+        .context("failed to update action item claimed flag")?;
         Ok(())
     }
 
@@ -585,6 +752,131 @@ impl Store {
             .context("failed to clear cached summaries")?;
         Ok(())
     }
+
+    // --- Email watermarks ---
+
+    /// Get the last-seen IMAP UID for a mailbox (0 = never fetched).
+    pub fn get_email_watermark(&self, mailbox: &str) -> u32 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT last_uid FROM email_watermark WHERE mailbox = ?1",
+            params![mailbox],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+        .map(|v| v as u32)
+        .unwrap_or(0)
+    }
+
+    pub fn set_email_watermark(&self, mailbox: &str, last_uid: u32) -> Result<()> {
+        let now = jiff::Timestamp::now().as_millisecond();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO email_watermark (mailbox, last_uid, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(mailbox) DO UPDATE SET last_uid = ?2, updated_at = ?3",
+            params![mailbox, last_uid as i64, now],
+        )
+        .context("failed to set email watermark")?;
+        Ok(())
+    }
+
+    // --- Cached email summaries ---
+
+    pub fn set_cached_email_summary(&self, mailbox: &str, json: &str) -> Result<()> {
+        let now = jiff::Timestamp::now().as_millisecond();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO cached_email_summary (mailbox, summary_json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(mailbox) DO UPDATE SET summary_json = ?2, updated_at = ?3",
+            params![mailbox, json, now],
+        )
+        .context("failed to set cached email summary")?;
+        Ok(())
+    }
+
+    pub fn get_cached_email_summaries(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT mailbox, summary_json FROM cached_email_summary ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to query cached email summaries")?;
+        Ok(rows)
+    }
+
+    pub fn remove_cached_email_summary(&self, mailbox: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM cached_email_summary WHERE mailbox = ?1",
+            params![mailbox],
+        )
+        .context("failed to remove cached email summary")?;
+        Ok(())
+    }
+}
+
+// --- Source config ---
+
+/// A single row from the `source_config` table.
+#[derive(Debug, Clone)]
+pub struct SourceConfigRow {
+    pub source_type: String,
+    pub name: String,
+    pub team: String,
+    pub enabled: bool,
+    pub instructions: Option<String>,
+}
+
+impl Store {
+    /// Return all source_config rows for `source_type` (e.g. "mm_channel").
+    pub fn get_source_configs(&self, source_type: &str) -> Result<Vec<SourceConfigRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT source_type, name, team, enabled, instructions
+             FROM source_config WHERE source_type = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![source_type], |row| {
+                Ok(SourceConfigRow {
+                    source_type: row.get(0)?,
+                    name: row.get(1)?,
+                    team: row.get(2)?,
+                    enabled: row.get::<_, i64>(3)? != 0,
+                    instructions: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to query source_config")?;
+        Ok(rows)
+    }
+
+    /// Insert or update a source_config entry.
+    pub fn upsert_source_config(
+        &self,
+        source_type: &str,
+        name: &str,
+        team: &str,
+        enabled: bool,
+        instructions: Option<&str>,
+    ) -> Result<()> {
+        let now = jiff::Timestamp::now().as_millisecond();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO source_config (source_type, name, team, enabled, instructions, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(source_type, name, team)
+             DO UPDATE SET enabled = ?4, instructions = ?5, updated_at = ?6",
+            params![source_type, name, team, enabled as i64, instructions, now],
+        )
+        .context("failed to upsert source_config")?;
+        Ok(())
+    }
 }
 
 fn action_item_id(channel_id: &str, text: &str) -> String {
@@ -602,6 +894,25 @@ mod tests {
 
     fn test_store() -> Store {
         Store::open(Path::new(":memory:")).expect("open in-memory store")
+    }
+
+    /// Convenience: build `Vec<LlmActionItem>` from plain text strings (no source_ids).
+    fn items(texts: &[&str]) -> Vec<LlmActionItem> {
+        texts
+            .iter()
+            .map(|t| LlmActionItem {
+                text: t.to_string(),
+                source_ids: vec![],
+            })
+            .collect()
+    }
+
+    /// Convenience: build a single `LlmActionItem` with source IDs.
+    fn item_with_src(text: &str, srcs: &[&str]) -> LlmActionItem {
+        LlmActionItem {
+            text: text.to_string(),
+            source_ids: srcs.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     #[test]
@@ -637,8 +948,8 @@ mod tests {
     #[test]
     fn action_items_upsert_and_pending() {
         let s = test_store();
-        let items = vec!["Fix bug".to_string(), "Deploy v2".to_string()];
-        s.upsert_action_items("ch1", &items, 1000).unwrap();
+        s.upsert_action_items("ch1", &items(&["Fix bug", "Deploy v2"]), 1000, "mattermost")
+            .unwrap();
 
         let pending = s.get_pending_action_items("ch1").unwrap();
         assert_eq!(pending.len(), 2);
@@ -649,22 +960,103 @@ mod tests {
     #[test]
     fn action_items_dedup() {
         let s = test_store();
-        let items = vec!["Fix bug".to_string()];
-        s.upsert_action_items("ch1", &items, 1000).unwrap();
-        s.upsert_action_items("ch1", &items, 2000).unwrap();
+        s.upsert_action_items("ch1", &items(&["Fix bug"]), 1000, "mattermost")
+            .unwrap();
+        s.upsert_action_items("ch1", &items(&["Fix bug"]), 2000, "mattermost")
+            .unwrap();
 
         let all = s.get_all_action_items("ch1").unwrap();
         assert_eq!(all.len(), 1);
     }
 
     #[test]
-    fn action_item_resolve_and_ignore() {
+    fn action_items_replace_stale_pending() {
         let s = test_store();
-        let items = vec!["Task A".to_string()];
-        s.upsert_action_items("ch1", &items, 1000).unwrap();
+        s.upsert_action_items("ch1", &items(&["Task A", "Task B"]), 1000, "mattermost")
+            .unwrap();
+        // Second cycle: Task A dropped, Task C added
+        s.upsert_action_items("ch1", &items(&["Task B", "Task C"]), 2000, "mattermost")
+            .unwrap();
 
         let pending = s.get_pending_action_items("ch1").unwrap();
-        let id = &pending[0].id;
+        assert_eq!(pending.len(), 2, "stale Task A should be gone");
+        assert!(pending.iter().any(|i| i.text == "Task B"));
+        assert!(pending.iter().any(|i| i.text == "Task C"));
+    }
+
+    #[test]
+    fn action_items_preserve_acted_on_across_replace() {
+        let s = test_store();
+        s.upsert_action_items("ch1", &items(&["Task A", "Task B"]), 1000, "mattermost")
+            .unwrap();
+
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        let id_a = pending
+            .iter()
+            .find(|i| i.text == "Task A")
+            .unwrap()
+            .id
+            .clone();
+        s.set_action_item_resolved(&id_a, true).unwrap();
+
+        // Next cycle omits Task A — resolved items must survive the replace
+        s.upsert_action_items("ch1", &items(&["Task B"]), 2000, "mattermost")
+            .unwrap();
+
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].text, "Task B");
+        let all = s.get_all_action_items("ch1").unwrap();
+        assert!(
+            all.iter().any(|i| i.text == "Task A" && i.resolved),
+            "resolved Task A must be preserved"
+        );
+    }
+
+    #[test]
+    fn action_item_source_id_matching() {
+        let s = test_store();
+        s.upsert_action_items(
+            "ch1",
+            &[item_with_src("Do the thing", &["msg1", "msg2"])],
+            1000,
+            "mattermost",
+        )
+        .unwrap();
+
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        assert_eq!(pending.len(), 1);
+        let id_before = pending[0].id.clone();
+
+        // Next cycle: same messages, slightly rephrased text
+        s.upsert_action_items(
+            "ch1",
+            &[item_with_src("Do the thing now.", &["msg1", "msg3"])],
+            2000,
+            "mattermost",
+        )
+        .unwrap();
+
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        assert_eq!(pending.len(), 1, "rephrased item should not duplicate");
+        assert_eq!(pending[0].id, id_before, "ID should be preserved");
+        assert_eq!(pending[0].text, "Do the thing now.", "text should be updated");
+        let src_set: std::collections::HashSet<&str> =
+            pending[0].source_ids.iter().map(String::as_str).collect();
+        assert!(
+            src_set.contains("msg1") && src_set.contains("msg2") && src_set.contains("msg3"),
+            "source_ids should be merged"
+        );
+    }
+
+    #[test]
+    fn action_item_resolve_and_ignore() {
+        let s = test_store();
+        s.upsert_action_items("ch1", &items(&["Task A"]), 1000, "mattermost")
+            .unwrap();
+
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        let id = &pending[0].id.clone();
 
         s.set_action_item_resolved(id, true).unwrap();
         assert!(s.get_pending_action_items("ch1").unwrap().is_empty());
@@ -748,5 +1140,160 @@ mod tests {
             all.get("sidebar_collapsed").map(|s| s.as_str()),
             Some("false"),
         );
+    }
+
+    #[test]
+    fn action_item_claim_and_unclaim() {
+        let s = test_store();
+        s.upsert_action_items("ch1", &items(&["Task A"]), 1000, "mattermost")
+            .unwrap();
+
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        let id = pending[0].id.clone();
+        assert!(!pending[0].claimed);
+
+        // Claiming keeps the item in the pending list (someone is working on it)
+        s.set_action_item_claimed(&id, true).unwrap();
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        assert_eq!(pending.len(), 1, "claimed item must still appear as pending");
+        assert!(pending[0].claimed);
+
+        // Unclaiming clears the flag
+        s.set_action_item_claimed(&id, false).unwrap();
+        let pending = s.get_pending_action_items("ch1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].claimed);
+    }
+
+    #[test]
+    fn action_item_claimed_visible_in_global_list() {
+        let s = test_store();
+        s.upsert_action_items("ch1", &items(&["Task A"]), 1000, "mattermost")
+            .unwrap();
+        let id = s.get_pending_action_items("ch1").unwrap()[0].id.clone();
+
+        s.set_action_item_claimed(&id, true).unwrap();
+
+        let global = s.get_all_action_items_global().unwrap();
+        assert_eq!(global.len(), 1);
+        assert!(global[0].claimed);
+    }
+
+    #[test]
+    fn email_watermark_defaults_to_zero() {
+        let s = test_store();
+        assert_eq!(s.get_email_watermark("INBOX"), 0);
+    }
+
+    #[test]
+    fn email_watermark_round_trip() {
+        let s = test_store();
+        s.set_email_watermark("INBOX", 42).unwrap();
+        assert_eq!(s.get_email_watermark("INBOX"), 42);
+    }
+
+    #[test]
+    fn email_watermark_update() {
+        let s = test_store();
+        s.set_email_watermark("INBOX", 10).unwrap();
+        s.set_email_watermark("INBOX", 99).unwrap();
+        assert_eq!(s.get_email_watermark("INBOX"), 99);
+    }
+
+    #[test]
+    fn email_watermark_per_mailbox() {
+        let s = test_store();
+        s.set_email_watermark("INBOX", 1).unwrap();
+        s.set_email_watermark("INBOX.Work", 2).unwrap();
+        assert_eq!(s.get_email_watermark("INBOX"), 1);
+        assert_eq!(s.get_email_watermark("INBOX.Work"), 2);
+    }
+
+    #[test]
+    fn cached_email_summary_crud() {
+        let s = test_store();
+        assert!(s.get_cached_email_summaries().unwrap().is_empty());
+
+        s.set_cached_email_summary("INBOX", r#"{"summary":"hello"}"#)
+            .unwrap();
+        let cached = s.get_cached_email_summaries().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].0, "INBOX");
+        assert_eq!(cached[0].1, r#"{"summary":"hello"}"#);
+
+        s.set_cached_email_summary("INBOX", r#"{"summary":"updated"}"#)
+            .unwrap();
+        let cached = s.get_cached_email_summaries().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].1, r#"{"summary":"updated"}"#);
+
+        s.remove_cached_email_summary("INBOX").unwrap();
+        assert!(s.get_cached_email_summaries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cached_email_summary_multiple_mailboxes() {
+        let s = test_store();
+        s.set_cached_email_summary("INBOX", "{}").unwrap();
+        s.set_cached_email_summary("INBOX.Work", "{}").unwrap();
+        assert_eq!(s.get_cached_email_summaries().unwrap().len(), 2);
+        s.remove_cached_email_summary("INBOX").unwrap();
+        let cached = s.get_cached_email_summaries().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].0, "INBOX.Work");
+    }
+
+    #[test]
+    fn source_config_upsert_and_get() {
+        let s = test_store();
+        assert!(s.get_source_configs("mm_channel").unwrap().is_empty());
+
+        s.upsert_source_config("mm_channel", "general", "TeamA", true, None)
+            .unwrap();
+        let rows = s.get_source_configs("mm_channel").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "general");
+        assert_eq!(rows[0].team, "TeamA");
+        assert!(rows[0].enabled);
+        assert!(rows[0].instructions.is_none());
+    }
+
+    #[test]
+    fn source_config_enabled_toggle() {
+        let s = test_store();
+        s.upsert_source_config("mm_channel", "general", "TeamA", true, None)
+            .unwrap();
+        s.upsert_source_config("mm_channel", "general", "TeamA", false, None)
+            .unwrap();
+        let rows = s.get_source_configs("mm_channel").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].enabled);
+    }
+
+    #[test]
+    fn source_config_instructions() {
+        let s = test_store();
+        s.upsert_source_config(
+            "mm_channel",
+            "support",
+            "TeamA",
+            true,
+            Some("Focus on escalations."),
+        )
+        .unwrap();
+        let rows = s.get_source_configs("mm_channel").unwrap();
+        assert_eq!(rows[0].instructions.as_deref(), Some("Focus on escalations."));
+    }
+
+    #[test]
+    fn source_config_filtered_by_source_type() {
+        let s = test_store();
+        s.upsert_source_config("mm_channel", "general", "TeamA", true, None)
+            .unwrap();
+        s.upsert_source_config("email_mailbox", "INBOX", "", true, None)
+            .unwrap();
+        assert_eq!(s.get_source_configs("mm_channel").unwrap().len(), 1);
+        assert_eq!(s.get_source_configs("email_mailbox").unwrap().len(), 1);
+        assert!(s.get_source_configs("other").unwrap().is_empty());
     }
 }

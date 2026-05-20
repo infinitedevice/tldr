@@ -18,6 +18,11 @@ use terminal_size::{Width, terminal_size};
 pub struct ActionItemSummary {
     pub id: String,
     pub text: String,
+    #[serde(default)]
+    pub claimed: bool,
+    /// IDs of the source messages that triggered this action item.
+    #[serde(default)]
+    pub source_ids: Vec<String>,
 }
 
 /// A named topic section within a channel summary, with pre-rendered HTML.
@@ -51,6 +56,38 @@ pub struct ChannelSummary {
     /// Display names of participants who posted in the unread window (DM / group channels only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<String>,
+}
+
+/// Brief metadata for a single email shown in the summary list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailMeta {
+    pub subject: String,
+    pub from: String,
+    pub date: String,
+}
+
+/// Summary for one email mailbox, analogous to [`ChannelSummary`] for Mattermost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailSummary {
+    /// Human-readable mailbox name (e.g. "INBOX" or "INBOX/People Leads").
+    pub mailbox: String,
+    /// URL-safe version of mailbox for use in API paths.
+    pub mailbox_id: String,
+    pub unread_count: usize,
+    pub summary: String,
+    pub summary_html: String,
+    /// Named topic sections — primary display. Falls back to summary_html when empty.
+    #[serde(default)]
+    pub topics: Vec<TopicSection>,
+    #[serde(default)]
+    pub action_items: Vec<ActionItemSummary>,
+    /// Brief list of emails included in this summary (subject, from, date).
+    #[serde(default)]
+    pub emails: Vec<EmailMeta>,
+    /// Highest UID seen in this batch — used by the mark-as-read handler to
+    /// advance the watermark.  Not displayed in the UI.
+    #[serde(default)]
+    pub max_uid: u32,
 }
 
 pub fn print_summaries(summaries: &[ChannelSummary]) {

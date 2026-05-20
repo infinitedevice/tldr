@@ -22,6 +22,9 @@ pub struct Config {
     pub paths: PathsConfig,
     #[serde(default)]
     pub server: ServerConfig,
+    /// Optional email (IMAP) data source. Absent means email is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<EmailConfig>,
     /// Mattermost @usernames whose messages should be highlighted in summaries.
     #[serde(default)]
     pub priority_users: Vec<String>,
@@ -36,6 +39,122 @@ pub struct MattermostConfig {
     pub server_url: String,
     #[serde(default = "default_mm_token")]
     pub token: String,
+    /// Per-channel overrides: enable/disable or add instructions for a specific channel.
+    /// Absent = all channels enabled with no extra instructions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<MmChannelConfig>,
+    /// Per-team overrides: enable/disable an entire team.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub teams: Vec<MmTeamConfig>,
+}
+
+/// Per-channel configuration override for a Mattermost channel.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MmChannelConfig {
+    /// Channel slug (internal name) or display name; matched case-sensitively.
+    pub name: String,
+    /// Restrict this entry to a specific team (by slug or display name).
+    /// If absent, applies to any team that has a matching channel name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    /// Set to `false` to skip this channel entirely.
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    /// Extra context injected into the LLM system prompt for this channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// Per-team configuration override for a Mattermost team.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MmTeamConfig {
+    /// Team slug (internal name) or display name; matched case-sensitively.
+    pub name: String,
+    /// Set to `false` to skip all channels in this team.
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    /// Extra context appended to every channel summary prompt in this team.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+fn bool_true() -> bool {
+    true
+}
+
+/// IMAP email data source configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EmailConfig {
+    pub server: String,
+    #[serde(default = "default_imap_port")]
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    /// Mailboxes to poll. Each entry is either a bare mailbox name string
+    /// (`"INBOX"`) or a table with `name`, optional `enabled` (default true),
+    /// and optional `instructions` for extra LLM context.
+    #[serde(default)]
+    pub mailboxes: Vec<MailboxConfig>,
+}
+
+/// Per-mailbox configuration. Supports both simple string form and full table.
+///
+/// Simple TOML:   `mailboxes = ["INBOX", "INBOX.Work"]`
+/// Full TOML:
+/// ```toml
+/// [[email.mailboxes]]
+/// name = "INBOX"
+/// instructions = "Focus on customer support escalations."
+///
+/// [[email.mailboxes]]
+/// name = "INBOX.Work"
+/// enabled = false
+/// ```
+#[derive(Debug, Clone, Serialize)]
+pub struct MailboxConfig {
+    pub name: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for MailboxConfig {
+    fn deserialize<D>(de: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Helper {
+            Simple(String),
+            Full {
+                name: String,
+                enabled: Option<bool>,
+                #[serde(default)]
+                instructions: Option<String>,
+            },
+        }
+        Ok(match Helper::deserialize(de)? {
+            Helper::Simple(name) => Self {
+                name,
+                enabled: true,
+                instructions: None,
+            },
+            Helper::Full {
+                name,
+                enabled,
+                instructions,
+            } => Self {
+                name,
+                enabled: enabled.unwrap_or(true),
+                instructions,
+            },
+        })
+    }
+}
+
+fn default_imap_port() -> u16 {
+    993
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -162,6 +281,8 @@ impl Default for MattermostConfig {
         Self {
             server_url: default_mm_server_url(),
             token: default_mm_token(),
+            channels: Vec::new(),
+            teams: Vec::new(),
         }
     }
 }
@@ -270,6 +391,7 @@ mod tests {
             mattermost: MattermostConfig {
                 server_url: "https://chat.example.com".into(),
                 token: "tok".into(),
+                ..Default::default()
             },
             llm: LlmConfig {
                 base_url: "https://llm.example.com".into(),
@@ -315,6 +437,7 @@ token = "x"
             mattermost: MattermostConfig {
                 server_url: "https://chat.example.com".into(),
                 token: "tok".into(),
+                ..Default::default()
             },
             llm: LlmConfig {
                 base_url: "https://llm.example.com".into(),
@@ -346,5 +469,74 @@ token = "x"
             assert!(p.to_string_lossy().starts_with(&home));
             assert!(p.to_string_lossy().ends_with("foo/bar"));
         }
+    }
+
+    #[test]
+    fn email_config_simple_mailboxes() {
+        let toml = r#"
+[mattermost]
+server_url = "https://chat.example.com"
+token = "tok"
+
+[email]
+server = "imap.example.com"
+username = "user@example.com"
+password = "s3cr3t"
+mailboxes = ["INBOX", "INBOX.Work"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let email = config.email.expect("email section should be present");
+        assert_eq!(email.server, "imap.example.com");
+        assert_eq!(email.port, 993);
+        assert_eq!(email.mailboxes.len(), 2);
+        assert_eq!(email.mailboxes[0].name, "INBOX");
+        assert!(email.mailboxes[0].enabled);
+        assert!(email.mailboxes[0].instructions.is_none());
+    }
+
+    #[test]
+    fn email_config_full_mailbox_table() {
+        let toml = r#"
+[mattermost]
+server_url = "https://chat.example.com"
+token = "tok"
+
+[email]
+server = "imap.example.com"
+username = "user@example.com"
+password = "s3cr3t"
+
+[[email.mailboxes]]
+name = "INBOX"
+instructions = "Focus on escalations."
+
+[[email.mailboxes]]
+name = "INBOX.Archive"
+enabled = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let email = config.email.unwrap();
+        assert_eq!(email.mailboxes.len(), 2);
+        assert_eq!(
+            email.mailboxes[0].instructions.as_deref(),
+            Some("Focus on escalations.")
+        );
+        assert!(email.mailboxes[0].enabled);
+        assert!(!email.mailboxes[1].enabled);
+    }
+
+    #[test]
+    fn email_config_absent_is_none() {
+        let toml = r#"
+[mattermost]
+server_url = "https://chat.example.com"
+token = "tok"
+
+[llm]
+base_url = "https://llm.example.com"
+model = "gpt-4o"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.email.is_none());
     }
 }

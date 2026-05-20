@@ -32,6 +32,9 @@ pub async fn handle_api_summarise(
     let channel_filter = query.channel.as_deref();
     let server_url = &state.config.mattermost.server_url;
 
+    let mm_channels = state.mm_channel_config.read().await.clone();
+    let mm_teams = state.mm_team_config.read().await.clone();
+
     state.summarise_active.fetch_add(1, Ordering::AcqRel);
     let result = summarise_all_unread(
         mm,
@@ -42,6 +45,8 @@ pub async fn handle_api_summarise(
         &state.config.priority_users,
         state.rag.as_ref().map(Arc::clone),
         Arc::clone(&state.llm_sem),
+        &mm_channels,
+        &mm_teams,
     )
     .await;
     state.summarise_active.fetch_sub(1, Ordering::AcqRel);
@@ -86,6 +91,8 @@ pub async fn handle_api_summarise_ndjson(
     let server_url = state.config.mattermost.server_url.clone();
     let store = state.store.clone();
     let priority_users = state.config.priority_users.clone();
+    let mm_channels = state.mm_channel_config.read().await.clone();
+    let mm_teams = state.mm_team_config.read().await.clone();
     let rag = state.rag.as_ref().map(Arc::clone);
     let llm_sem = Arc::clone(&state.llm_sem);
     let summarise_active = Arc::clone(&state.summarise_active);
@@ -104,6 +111,8 @@ pub async fn handle_api_summarise_ndjson(
             &priority_users,
             rag,
             llm_sem,
+            &mm_channels,
+            &mm_teams,
         )
         .await
         .ok();
@@ -209,6 +218,8 @@ pub async fn handle_summarise(
     };
 
     let server_url = state.config.mattermost.server_url.clone();
+    let mm_channels = state.mm_channel_config.read().await.clone();
+    let mm_teams = state.mm_team_config.read().await.clone();
 
     state.summarise_active.fetch_add(1, Ordering::AcqRel);
     let slash_result = summarise_all_unread(
@@ -220,6 +231,8 @@ pub async fn handle_summarise(
         &state.config.priority_users,
         state.rag.as_ref().map(Arc::clone),
         Arc::clone(&state.llm_sem),
+        &mm_channels,
+        &mm_teams,
     )
     .await;
     state.summarise_active.fetch_sub(1, Ordering::AcqRel);
