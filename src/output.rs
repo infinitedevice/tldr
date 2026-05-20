@@ -18,6 +18,8 @@ use terminal_size::{Width, terminal_size};
 pub struct ActionItemSummary {
     pub id: String,
     pub text: String,
+    #[serde(default)]
+    pub claimed: bool,
 }
 
 /// A named topic section within a channel summary, with pre-rendered HTML.

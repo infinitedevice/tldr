@@ -350,13 +350,20 @@ pub async fn handle_channel_mark_read(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let now = jiff::Timestamp::now().as_millisecond();
-    match store.set_watermark(&channel_id, now) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            warn!("mark-read error for {channel_id}: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+    if let Err(e) = store.set_watermark(&channel_id, now) {
+        warn!("mark-read error for {channel_id}: {e:#}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    // Evict from SQLite cache so the channel doesn't reappear on next GET
+    if let Err(e) = store.remove_cached_summary(&channel_id) {
+        warn!("mark-read: failed to remove cached summary for {channel_id}: {e:#}");
+    }
+    // Evict from the in-memory summary_cache so SSE and GET don't bring it back
+    {
+        let mut cache = state.summary_cache.write().await;
+        cache.retain(|s| s.channel_id != channel_id);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 // ── Insights ────────────────────────────────────────────────────────────
@@ -547,6 +554,8 @@ pub async fn handle_action_item_patch(
     let result = match body.action.as_str() {
         "ignore" => store.set_action_item_ignored(&id, true),
         "resolve" => store.set_action_item_resolved(&id, true),
+        "claim" => store.set_action_item_claimed(&id, true),
+        "unclaim" => store.set_action_item_claimed(&id, false),
         other => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -595,11 +604,34 @@ pub async fn handle_seeding_status(State(state): State<Arc<AppState>>) -> impl I
 // ── Summaries (cached + SSE) ────────────────────────────────────────────
 
 /// Return the in-memory summary cache instantly (no LLM calls).
+///
+/// Action items are re-hydrated from the live store on every request so that
+/// ignore/resolve changes made via PATCH are reflected immediately without
+/// waiting for the next summarisation cycle.
 pub async fn handle_summaries_cached(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cache = state.summary_cache.read().await;
+    let summaries: Vec<crate::output::ChannelSummary> = if let Some(store) = &state.store {
+        cache
+            .iter()
+            .map(|s| {
+                let action_items = store
+                    .get_pending_action_items(&s.channel_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|a| crate::output::ActionItemSummary { id: a.id, text: a.text, claimed: a.claimed })
+                    .collect();
+                crate::output::ChannelSummary {
+                    action_items,
+                    ..s.clone()
+                }
+            })
+            .collect()
+    } else {
+        cache.clone()
+    };
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "summaries": *cache })),
+        Json(serde_json::json!({ "ok": true, "summaries": summaries })),
     )
 }
 

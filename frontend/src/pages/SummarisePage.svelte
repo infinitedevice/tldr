@@ -37,6 +37,8 @@
 
   let summaries: Summary[] = $state([]);
   let favouriteIds: Set<string> = $state(new Set());
+  // Channels the user has dismissed via "Mark as read" — SSE must not re-inject these
+  let dismissedChannelIds: Set<string> = $state(new Set());
   let loading = $state(true);
   let error: string | null = $state(null);
   let eventSource: EventSource | null = null;
@@ -99,6 +101,8 @@
   const multiTeam = $derived(allTeamNames.length > 1);
 
   function mergeSummary(incoming: Summary) {
+    // Don't re-inject channels the user has dismissed
+    if (dismissedChannelIds.has(incoming.channel_id)) return;
     const idx = summaries.findIndex(
       (s) => s.channel_id === incoming.channel_id,
     );
@@ -193,6 +197,8 @@
   });
 
   function onMarkRead(channelId: string) {
+    // Track dismissed channels so SSE doesn't silently bring them back
+    dismissedChannelIds = new Set([...dismissedChannelIds, channelId]);
     summaries = summaries.filter((s) => s.channel_id !== channelId);
   }
 
@@ -224,15 +230,21 @@
   }
 
   function onActionItemUpdate() {
-    // Re-fetch cached summaries to reflect action item state changes
+    // Merge action item state in-place: only update action_items per channel,
+    // never re-sort or replace the full array — preserves scroll position and order.
     fetch("/api/v1/summaries")
       .then((r) => (r.ok ? r.json() : null))
       .then((d: { summaries?: Summary[] } | null) => {
-        if (d?.summaries) {
-          summaries = d.summaries.sort(
-            (a: Summary, b: Summary) => b.mention_count - a.mention_count,
-          );
-        }
+        if (!d?.summaries) return;
+        const freshMap = new Map(
+          d.summaries.map((s: Summary) => [s.channel_id, s.action_items]),
+        );
+        summaries = summaries.map((s) => {
+          const freshItems = freshMap.get(s.channel_id);
+          return freshItems !== undefined
+            ? { ...s, action_items: freshItems }
+            : s;
+        });
       })
       .catch(() => {});
   }
